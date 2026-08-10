@@ -9,9 +9,12 @@
 #include "neighbors_device_intrinsics.cuh"
 #include "nn_descent_gnnd.hpp"
 
+#include "../../core/nvtx.hpp"
 #include "../../core/omp_wrapper.hpp"
+#include "../bbq.cuh"
 #include <cuvs/distance/distance.hpp>
 #include <cuvs/neighbors/nn_descent.hpp>
+#include <cuvs/preprocessing/quantize/bbq.hpp>
 
 #include <raft/core/copy.cuh>
 #include <raft/core/device_mdarray.hpp>
@@ -563,6 +566,47 @@ __device__ __forceinline__ void calculate_metric(float* s_distances,
     }
   }
 }
+template <typename Index_t, typename DistEpilogue_t>
+__device__ __forceinline__ void calculate_metric(
+  float* s_distances,
+  Index_t* row_neighbors,
+  int list_row_size,
+  Index_t* col_neighbors,
+  int list_col_size,
+  const cuvs::preprocessing::quantize::bbq::bbq_dataset_view& data,
+  DistData_t* l2_norms,
+  cuvs::distance::DistanceType metric,
+  DistEpilogue_t dist_epilogue)
+{
+  const bool can_postprocess_dist = std::is_same_v<DistEpilogue_t, raft::identity_op>;
+
+  for (int i = threadIdx.x; i < MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES; i += blockDim.x) {
+    const int row_id = i / SKEWED_MAX_NUM_BI_SAMPLES;
+    const int col_id = i % SKEWED_MAX_NUM_BI_SAMPLES;
+
+    if (row_id < list_row_size && col_id < list_col_size) {
+      const Index_t row = row_neighbors[row_id];
+      const Index_t col = col_neighbors[col_id];
+
+      if (metric == cuvs::distance::DistanceType::L2Expanded ||
+          metric == cuvs::distance::DistanceType::L2SqrtExpanded) {
+        s_distances[i] = cuvs::preprocessing::quantize::bbq::l2_distance(data, row, col);
+        if (!can_postprocess_dist && metric == cuvs::distance::DistanceType::L2SqrtExpanded) {
+          s_distances[i] = sqrtf(s_distances[i]);
+        }
+      } else if (metric == cuvs::distance::DistanceType::InnerProduct) {
+        s_distances[i] = -cuvs::preprocessing::quantize::bbq::dot_product(data, row, col);
+      } else if (metric == cuvs::distance::DistanceType::CosineExpanded) {
+        const float norm_product = l2_norms[row] * l2_norms[col];
+        const float dot          = cuvs::preprocessing::quantize::bbq::dot_product(data, row, col);
+        s_distances[i]           = norm_product > 0.0f ? 1.0f - dot / sqrtf(norm_product) : 0.0f;
+      }
+      s_distances[i] = dist_epilogue(s_distances[i], row, col);
+    } else {
+      s_distances[i] = std::numeric_limits<float>::max();
+    }
+  }
+}
 
 struct DistAccumulator {
   cuvs::distance::DistanceType metric;
@@ -846,6 +890,118 @@ __launch_bounds__(BLOCK_SIZE)
     }
   }
 #endif
+}
+
+template <typename Index_t, typename ID_t = InternalID_t<Index_t>, typename DistEpilogue_t>
+RAFT_KERNEL local_join_kernel_bbq(const Index_t* graph_new,
+                                  const Index_t* rev_graph_new,
+                                  const int2* sizes_new,
+                                  const Index_t* graph_old,
+                                  const Index_t* rev_graph_old,
+                                  const int2* sizes_old,
+                                  const int width,
+                                  cuvs::preprocessing::quantize::bbq::bbq_dataset_view dataset,
+                                  ID_t* graph,
+                                  DistData_t* dists,
+                                  int graph_width,
+                                  int* locks,
+                                  DistData_t* l2_norms,
+                                  cuvs::distance::DistanceType metric,
+                                  DistEpilogue_t dist_epilogue)
+{
+  __shared__ int s_list[MAX_NUM_BI_SAMPLES * 2];
+  __shared__ int s_unique_counter[2];
+  __shared__ float s_distances[MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES];
+
+  if (threadIdx.x < 2) { s_unique_counter[threadIdx.x] = 0; }
+
+  Index_t* new_neighbors = s_list;
+  Index_t* old_neighbors = s_list + MAX_NUM_BI_SAMPLES;
+  const size_t list_id   = blockIdx.x;
+  const int2 new_size2   = sizes_new[list_id];
+  const int2 old_size2   = sizes_old[list_id];
+  int new_size           = new_size2.x + new_size2.y;
+  int old_size           = old_size2.x + old_size2.y;
+  const int tx           = threadIdx.x;
+
+  if (!new_size) return;
+  if (tx < new_size2.x) {
+    new_neighbors[tx] = graph_new[list_id * width + tx];
+  } else if (tx < new_size) {
+    new_neighbors[tx] = rev_graph_new[list_id * width + tx - new_size2.x];
+  }
+  if (tx < old_size2.x) {
+    old_neighbors[tx] = graph_old[list_id * width + tx];
+  } else if (tx < old_size) {
+    old_neighbors[tx] = rev_graph_old[list_id * width + tx - old_size2.x];
+  }
+  __syncthreads();
+
+  remove_duplicates(
+    new_neighbors, new_size2.x, new_neighbors + new_size2.x, new_size2.y, s_unique_counter[0], 0);
+  remove_duplicates(
+    old_neighbors, old_size2.x, old_neighbors + old_size2.x, old_size2.y, s_unique_counter[1], 1);
+  __syncthreads();
+  new_size = new_size2.x + s_unique_counter[0];
+  old_size = old_size2.x + s_unique_counter[1];
+
+  constexpr int num_warps = BLOCK_SIZE / raft::warp_size();
+  calculate_metric(s_distances,
+                   new_neighbors,
+                   new_size,
+                   new_neighbors,
+                   new_size,
+                   dataset,
+                   l2_norms,
+                   metric,
+                   dist_epilogue);
+  __syncthreads();
+
+  for (int step = 0; step < raft::ceildiv(new_size, num_warps); ++step) {
+    const int idx_in_list = step * num_warps + tx / raft::warp_size();
+    if (idx_in_list >= new_size) continue;
+    auto min_elem = get_min_item(s_list[idx_in_list], idx_in_list, new_neighbors, s_distances);
+    if (min_elem.id() < gridDim.x) {
+      insert_to_global_graph(min_elem, s_list[idx_in_list], graph, dists, graph_width, locks);
+    }
+  }
+
+  if (!old_size) return;
+  __syncthreads();
+
+  calculate_metric(s_distances,
+                   new_neighbors,
+                   new_size,
+                   old_neighbors,
+                   old_size,
+                   dataset,
+                   l2_norms,
+                   metric,
+                   dist_epilogue);
+  __syncthreads();
+
+  for (int step = 0; step < raft::ceildiv(MAX_NUM_BI_SAMPLES * 2, num_warps); ++step) {
+    const int idx_in_list = step * num_warps + tx / raft::warp_size();
+    if (idx_in_list >= new_size && idx_in_list < MAX_NUM_BI_SAMPLES) continue;
+    if (idx_in_list >= MAX_NUM_BI_SAMPLES + old_size && idx_in_list < MAX_NUM_BI_SAMPLES * 2) {
+      continue;
+    }
+
+    ResultItem<Index_t> min_elem{std::numeric_limits<Index_t>::max(),
+                                 std::numeric_limits<DistData_t>::max()};
+    if (idx_in_list < MAX_NUM_BI_SAMPLES) {
+      auto temp_min_item =
+        get_min_item(s_list[idx_in_list], idx_in_list, old_neighbors, s_distances);
+      if (temp_min_item.dist() < min_elem.dist()) { min_elem = temp_min_item; }
+    } else {
+      auto temp_min_item = get_min_item(
+        s_list[idx_in_list], idx_in_list - MAX_NUM_BI_SAMPLES, new_neighbors, s_distances, false);
+      if (temp_min_item.dist() < min_elem.dist()) { min_elem = temp_min_item; }
+    }
+    if (min_elem.id() < gridDim.x) {
+      insert_to_global_graph(min_elem, s_list[idx_in_list], graph, dists, graph_width, locks);
+    }
+  }
 }
 
 // launch_bounds here denote BLOCK_SIZE = 512 and MIN_BLOCKS_PER_SM = 4
@@ -1498,6 +1654,31 @@ void GNND<Data_t, Index_t>::local_join(cudaStream_t stream, DistEpilogue_t dist_
 
 template <typename Data_t, typename Index_t>
 template <typename DistEpilogue_t>
+void GNND<Data_t, Index_t>::local_join(cudaStream_t stream,
+                                       cuvs::preprocessing::quantize::bbq::bbq_dataset_view dataset,
+                                       DistEpilogue_t dist_epilogue)
+{
+  raft::matrix::fill(res, dists_buffer_.view(), std::numeric_limits<float>::max());
+  local_join_kernel_bbq<<<nrow_, BLOCK_SIZE, 0, stream>>>(graph_.h_graph_new.data_handle(),
+                                                          h_rev_graph_new_.data_handle(),
+                                                          d_list_sizes_new_.data_handle(),
+                                                          h_graph_old_.data_handle(),
+                                                          h_rev_graph_old_.data_handle(),
+                                                          d_list_sizes_old_.data_handle(),
+                                                          NUM_SAMPLES,
+                                                          dataset,
+                                                          graph_buffer_.data_handle(),
+                                                          dists_buffer_.data_handle(),
+                                                          DEGREE_ON_DEVICE,
+                                                          d_locks_.data_handle(),
+                                                          l2_norms_.data_handle(),
+                                                          build_config_.metric,
+                                                          dist_epilogue);
+  RAFT_CUDA_TRY(cudaPeekAtLastError());
+}
+
+template <typename Data_t, typename Index_t>
+template <typename DistEpilogue_t>
 void GNND<Data_t, Index_t>::build(Data_t* data,
                                   const Index_t nrow,
                                   Index_t* output_graph,
@@ -1781,6 +1962,209 @@ void GNND<Data_t, Index_t>::build(Data_t* data,
   }
 }
 
+template <typename Data_t, typename Index_t>
+template <typename DistEpilogue_t>
+void GNND<Data_t, Index_t>::build(cuvs::preprocessing::quantize::bbq::bbq_dataset_view dataset,
+                                  Index_t* output_graph,
+                                  bool return_distances,
+                                  DistData_t* output_distances,
+                                  DistEpilogue_t dist_epilogue)
+{
+  cudaStream_t stream = raft::resource::get_cuda_stream(res);
+  nrow_               = static_cast<size_t>(dataset.n_rows());
+  graph_.nrow         = nrow_;
+  graph_.bloom_filter.set_nrow(nrow_);
+  update_counter_ = 0;
+  graph_.h_graph  = reinterpret_cast<InternalID_t<Index_t>*>(output_graph);
+
+  if (build_config_.metric == cuvs::distance::DistanceType::CosineExpanded) {
+    raft::linalg::map_offset(res, l2_norms_.view(), [=] __device__(size_t row) {
+      return cuvs::preprocessing::quantize::bbq::row_norm(dataset, static_cast<int64_t>(row));
+    });
+  }
+
+  graph_.clear();
+  graph_.init_random_graph();
+  graph_.sample_graph(true);
+
+  auto update_and_sample = [&](bool update_graph) {
+    if (update_graph) {
+      update_counter_ = 0;
+      graph_.update_graph(graph_host_buffer_.data_handle(),
+                          dists_host_buffer_.data_handle(),
+                          DEGREE_ON_DEVICE,
+                          update_counter_);
+      if (update_counter_ < build_config_.termination_threshold * nrow_ *
+                              build_config_.dataset_dim / counter_interval) {
+        update_counter_ = -1;
+      }
+    }
+    graph_.sample_graph(false);
+  };
+
+  for (size_t it = 0; it < build_config_.max_iterations; ++it) {
+    raft::copy(res, d_list_sizes_new_.view(), graph_.h_list_sizes_new.view());
+    raft::copy(res, h_graph_old_.view(), graph_.h_graph_old.view());
+    raft::copy(res, d_list_sizes_old_.view(), graph_.h_list_sizes_old.view());
+    raft::resource::sync_stream(res);
+
+    std::thread update_and_sample_thread(update_and_sample, it);
+    RAFT_LOG_DEBUG("# GNND iteration: %lu / %lu", it + 1, build_config_.max_iterations);
+
+    static_assert(DEGREE_ON_DEVICE * sizeof(*(dists_buffer_.data_handle())) >=
+                  NUM_SAMPLES * sizeof(*(graph_buffer_.data_handle())));
+    add_reverse_edges(graph_.h_graph_new.data_handle(),
+                      h_rev_graph_new_.data_handle(),
+                      reinterpret_cast<Index_t*>(dists_buffer_.data_handle()),
+                      d_list_sizes_new_.data_handle(),
+                      stream);
+    add_reverse_edges(h_graph_old_.data_handle(),
+                      h_rev_graph_old_.data_handle(),
+                      reinterpret_cast<Index_t*>(dists_buffer_.data_handle()),
+                      d_list_sizes_old_.data_handle(),
+                      stream);
+
+    local_join(stream, dataset, dist_epilogue);
+    update_and_sample_thread.join();
+    if (update_counter_ == -1) { break; }
+    raft::copy(res, graph_host_buffer_.view(), graph_buffer_.view());
+    raft::copy(res, dists_host_buffer_.view(), dists_buffer_.view());
+    raft::resource::sync_stream(res);
+    graph_.sample_graph_new(graph_host_buffer_.data_handle(), DEGREE_ON_DEVICE);
+  }
+
+  graph_.update_graph(graph_host_buffer_.data_handle(),
+                      dists_host_buffer_.data_handle(),
+                      DEGREE_ON_DEVICE,
+                      update_counter_);
+  raft::resource::sync_stream(res);
+  graph_.sort_lists();
+
+  static_assert(sizeof(decltype(*(graph_.h_dists.data_handle()))) >= sizeof(Index_t));
+  if (return_distances) {
+    auto graph_h_dists = raft::make_host_matrix<DistData_t, int64_t, raft::row_major>(
+      nrow_, build_config_.output_graph_degree);
+#pragma omp parallel for
+    for (size_t i = 0; i < nrow_; ++i) {
+      for (size_t j = 0; j < build_config_.output_graph_degree; ++j) {
+        graph_h_dists(i, j) = graph_.h_dists(i, j);
+      }
+    }
+    raft::copy(
+      res,
+      raft::make_device_vector_view(output_distances, nrow_ * build_config_.output_graph_degree),
+      raft::make_host_vector_view(graph_h_dists.data_handle(),
+                                  nrow_ * build_config_.output_graph_degree));
+
+    auto output_dist_view = raft::make_device_matrix_view<DistData_t, int64_t, raft::row_major>(
+      output_distances, nrow_, build_config_.output_graph_degree);
+    const bool can_postprocess_dist = std::is_same_v<DistEpilogue_t, raft::identity_op>;
+    if (build_config_.metric == cuvs::distance::DistanceType::L2SqrtExpanded &&
+        can_postprocess_dist) {
+      raft::linalg::map(
+        res, output_dist_view, raft::sqrt_op{}, raft::make_const_mdspan(output_dist_view));
+    } else if (!cuvs::distance::is_min_close(build_config_.metric) && can_postprocess_dist) {
+      raft::linalg::map(res,
+                        output_dist_view,
+                        raft::mul_const_op<DistData_t>(-1),
+                        raft::make_const_mdspan(output_dist_view));
+    }
+    raft::resource::sync_stream(res);
+  }
+
+  auto* graph_shrink_buffer = reinterpret_cast<Index_t*>(graph_.h_dists.data_handle());
+#pragma omp parallel for
+  for (size_t i = 0; i < nrow_; ++i) {
+    for (size_t j = 0; j < build_config_.node_degree; ++j) {
+      const size_t index = i * graph_.node_degree + j;
+      const int id       = graph_.h_graph[index].id();
+      graph_shrink_buffer[i * build_config_.node_degree + j] =
+        id < static_cast<int>(nrow_) ? id
+                                     : cuvs::neighbors::detail::device::xorshift64(index) % nrow_;
+    }
+  }
+  graph_.h_graph = nullptr;
+
+#pragma omp parallel for
+  for (size_t i = 0; i < nrow_; ++i) {
+    for (size_t j = 0; j < build_config_.node_degree; ++j) {
+      output_graph[i * build_config_.node_degree + j] =
+        graph_shrink_buffer[i * build_config_.node_degree + j];
+    }
+  }
+}
+
+inline void validate_bbq_dataset(
+  const cuvs::preprocessing::quantize::bbq::bbq_dataset_view& dataset,
+  cuvs::distance::DistanceType metric)
+{
+  const auto n_rows = static_cast<int64_t>(dataset.n_rows());
+  RAFT_EXPECTS(dataset.bits >= 1 && dataset.bits <= 8, "BBQ bits must be in [1, 8].");
+  RAFT_EXPECTS(dataset.dim > 0, "BBQ dimension must be positive.");
+  RAFT_EXPECTS(dataset.encoded_row_length() > 0, "Unsupported BBQ code layout.");
+  RAFT_EXPECTS(dataset.codes.extent(1) == static_cast<int64_t>(dataset.encoded_row_length()),
+               "BBQ code row width does not match dim, bits, and layout.");
+  RAFT_EXPECTS(dataset.lower_intervals.extent(0) == n_rows &&
+                 dataset.upper_intervals.extent(0) == n_rows &&
+                 dataset.additional_corrections.extent(0) == n_rows &&
+                 dataset.quantized_component_sums.extent(0) == n_rows,
+               "Every BBQ correction array must contain one value per row.");
+  RAFT_EXPECTS(dataset.centroid.extent(0) == static_cast<int64_t>(dataset.dim),
+               "BBQ centroid length must equal the logical dimension.");
+  RAFT_EXPECTS(metric == cuvs::distance::DistanceType::L2Expanded ||
+                 metric == cuvs::distance::DistanceType::L2SqrtExpanded ||
+                 metric == cuvs::distance::DistanceType::CosineExpanded ||
+                 metric == cuvs::distance::DistanceType::InnerProduct,
+               "BBQ NN-Descent supports L2Expanded, L2SqrtExpanded, CosineExpanded, and "
+               "InnerProduct.");
+  RAFT_EXPECTS(metric == dataset.metric,
+               "BBQ dataset metric does not match the NN-Descent metric.");
+}
+
+template <typename IdxT = uint32_t>
+void build(raft::resources const& res,
+           const index_params& params,
+           cuvs::preprocessing::quantize::bbq::bbq_dataset_view dataset,
+           index<IdxT>& idx)
+{
+  cuvs::common::nvtx::range<cuvs::common::nvtx::domain::cuvs> fun_scope(
+    "neighbors::nn_descent::detail::build-bbq(%zu, %zu, %zu, %zu, %zu)",
+    size_t(dataset.n_rows()),
+    size_t(dataset.dim),
+    size_t(idx.graph().extent(1)),
+    size_t(idx.metric()),
+    size_t(dataset.bits));
+  validate_bbq_dataset(dataset, idx.metric());
+
+  size_t extended_graph_degree;
+  size_t graph_degree;
+  auto build_config = get_build_config(
+    res, params, dataset.n_rows(), dataset.dim, idx.metric(), extended_graph_degree, graph_degree);
+  auto int_graph =
+    raft::make_host_matrix<int, int64_t, raft::row_major>(dataset.n_rows(), extended_graph_degree);
+  GNND<const uint8_t, int> nnd(res, build_config);
+
+  if (idx.distances().has_value() || !params.return_distances) {
+    nnd.build(dataset,
+              int_graph.data_handle(),
+              params.return_distances,
+              idx.distances()
+                .value_or(raft::make_device_matrix<float, int64_t>(res, 0, 0).view())
+                .data_handle());
+  } else {
+    RAFT_FAIL(
+      "Distance view not allocated. Using return_distances set to true requires "
+      "distance view to be allocated.");
+  }
+
+#pragma omp parallel for
+  for (size_t i = 0; i < dataset.n_rows(); ++i) {
+    for (size_t j = 0; j < graph_degree; ++j) {
+      idx.graph()(i, j) = int_graph(i, j);
+    }
+  }
+}
+
 template <typename T,
           typename IdxT = uint32_t,
           typename Accessor =
@@ -1837,6 +2221,30 @@ void build(raft::resources const& res,
       graph[i * graph_degree + j] = int_graph.data_handle()[i * extended_graph_degree + j];
     }
   }
+}
+
+template <typename IdxT = uint32_t>
+index<IdxT> build(raft::resources const& res,
+                  const index_params& params,
+                  cuvs::preprocessing::quantize::bbq::bbq_dataset_view dataset)
+{
+  size_t graph_degree = params.graph_degree;
+  if (params.intermediate_graph_degree < graph_degree) {
+    RAFT_LOG_WARN(
+      "Graph degree (%lu) cannot be larger than intermediate graph degree (%lu), reducing "
+      "graph_degree.",
+      graph_degree,
+      params.intermediate_graph_degree);
+    graph_degree = params.intermediate_graph_degree;
+  }
+
+  index<IdxT> idx{res,
+                  static_cast<int64_t>(dataset.n_rows()),
+                  static_cast<int64_t>(graph_degree),
+                  params.return_distances,
+                  params.metric};
+  build(res, params, dataset, idx);
+  return idx;
 }
 
 template <typename T,

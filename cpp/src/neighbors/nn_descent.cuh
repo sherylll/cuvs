@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2026, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -182,6 +182,23 @@ void build(raft::resources const& res,
            index<IdxT>& idx)
 {
   detail::build<T, IdxT>(res, params, dataset, idx);
+}
+
+template <typename IdxT = uint32_t>
+auto build(raft::resources const& res,
+           index_params const& params,
+           cuvs::preprocessing::quantize::bbq::bbq_dataset_view dataset) -> index<IdxT>
+{
+  return detail::build<IdxT>(res, params, dataset);
+}
+
+template <typename IdxT = uint32_t>
+void build(raft::resources const& res,
+           index_params const& params,
+           cuvs::preprocessing::quantize::bbq::bbq_dataset_view dataset,
+           index<IdxT>& idx)
+{
+  detail::build<IdxT>(res, params, dataset, idx);
 }
 
 /** @} */  // end group nn-descent

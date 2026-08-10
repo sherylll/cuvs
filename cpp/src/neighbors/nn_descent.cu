@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -12,6 +12,20 @@
 
 using namespace raft;
 namespace cuvs::neighbors::nn_descent {
+
+auto build(raft::resources const& res,
+           index_params const& params,
+           cuvs::preprocessing::quantize::bbq::bbq_dataset_view dataset,
+           std::optional<raft::host_matrix_view<uint32_t, int64_t, raft::row_major>> graph)
+  -> index<uint32_t>
+{
+  if (!graph.has_value()) { return detail::build<uint32_t>(res, params, dataset); }
+
+  std::optional<raft::device_matrix_view<float, int64_t, raft::row_major>> distances = std::nullopt;
+  index<uint32_t> idx{res, graph.value(), distances, params.metric};
+  detail::build<uint32_t>(res, params, dataset, idx);
+  return idx;
+}
 
 /**
  * @brief Test if we have enough GPU memory to run NN descent algorithm.
