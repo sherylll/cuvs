@@ -566,6 +566,7 @@ __device__ __forceinline__ void calculate_metric(float* s_distances,
     }
   }
 }
+
 template <typename Index_t, typename DistEpilogue_t>
 __device__ __forceinline__ void calculate_metric(
   float* s_distances,
@@ -585,21 +586,23 @@ __device__ __forceinline__ void calculate_metric(
     const int col_id = i % SKEWED_MAX_NUM_BI_SAMPLES;
 
     if (row_id < list_row_size && col_id < list_col_size) {
-      const Index_t row = row_neighbors[row_id];
-      const Index_t col = col_neighbors[col_id];
+      const Index_t row    = row_neighbors[row_id];
+      const Index_t col    = col_neighbors[col_id];
+      const float I        = s_distances[i];
+      const float centered = cuvs::preprocessing::quantize::bbq::centered_dot(data, I, row, col);
 
       if (metric == cuvs::distance::DistanceType::L2Expanded ||
           metric == cuvs::distance::DistanceType::L2SqrtExpanded) {
-        s_distances[i] = cuvs::preprocessing::quantize::bbq::l2_distance(data, row, col);
+        s_distances[i] = cuvs::preprocessing::quantize::bbq::l2_distance(data, centered, row, col);
         if (!can_postprocess_dist && metric == cuvs::distance::DistanceType::L2SqrtExpanded) {
           s_distances[i] = sqrtf(s_distances[i]);
         }
       } else if (metric == cuvs::distance::DistanceType::InnerProduct) {
-        s_distances[i] = -cuvs::preprocessing::quantize::bbq::dot_product(data, row, col);
+        s_distances[i] = -cuvs::preprocessing::quantize::bbq::dot_product(data, centered, row, col);
       } else if (metric == cuvs::distance::DistanceType::CosineExpanded) {
         const float norm_product = l2_norms[row] * l2_norms[col];
-        const float dot          = cuvs::preprocessing::quantize::bbq::dot_product(data, row, col);
-        s_distances[i]           = norm_product > 0.0f ? 1.0f - dot / sqrtf(norm_product) : 0.0f;
+        const float dot = cuvs::preprocessing::quantize::bbq::dot_product(data, centered, row, col);
+        s_distances[i]  = norm_product > 0.0f ? 1.0f - dot / sqrtf(norm_product) : 0.0f;
       }
       s_distances[i] = dist_epilogue(s_distances[i], row, col);
     } else {
@@ -909,11 +912,19 @@ RAFT_KERNEL local_join_kernel_bbq(const Index_t* graph_new,
                                   cuvs::distance::DistanceType metric,
                                   DistEpilogue_t dist_epilogue)
 {
+  constexpr int BBQ_ROW_BYTES = 128;
+  constexpr int BBQ_PAD       = 4;
+
   __shared__ int s_list[MAX_NUM_BI_SAMPLES * 2];
-  __shared__ int s_unique_counter[2];
+  __shared__ uint8_t s_nv[MAX_NUM_BI_SAMPLES][BBQ_ROW_BYTES + BBQ_PAD];
+  __shared__ uint8_t s_ov[MAX_NUM_BI_SAMPLES][BBQ_ROW_BYTES + BBQ_PAD];
   __shared__ float s_distances[MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES];
 
-  if (threadIdx.x < 2) { s_unique_counter[threadIdx.x] = 0; }
+  int* s_unique_counter = reinterpret_cast<int*>(&s_ov[0][0]);
+  if (threadIdx.x == 0) {
+    s_unique_counter[0] = 0;
+    s_unique_counter[1] = 0;
+  }
 
   Index_t* new_neighbors = s_list;
   Index_t* old_neighbors = s_list + MAX_NUM_BI_SAMPLES;
@@ -945,7 +956,62 @@ RAFT_KERNEL local_join_kernel_bbq(const Index_t* graph_new,
   new_size = new_size2.x + s_unique_counter[0];
   old_size = old_size2.x + s_unique_counter[1];
 
-  constexpr int num_warps = BLOCK_SIZE / raft::warp_size();
+  const int warp_id               = threadIdx.x / raft::warp_size();
+  const int lane_id               = threadIdx.x % raft::warp_size();
+  constexpr int num_warps         = BLOCK_SIZE / raft::warp_size();
+  const uint8_t* codes            = dataset.codes.data_handle();
+  const size_t encoded_row_length = dataset.encoded_row_length();
+  const int n_planes              = [](cuvs::preprocessing::quantize::bbq::code_layout layout) {
+    if (layout == cuvs::preprocessing::quantize::bbq::code_layout::dibit) { return 2; }
+    if (layout == cuvs::preprocessing::quantize::bbq::code_layout::transpose_half_byte) {
+      return 4;
+    }
+    return 1;
+  }(dataset.layout);
+  const size_t tile_extent = encoded_row_length / static_cast<size_t>(n_planes);
+  // Each plane gets an equal slice of the row in shared memory, so the cached bytes always form a
+  // valid encoded chunk.
+  const int plane_tile    = BBQ_ROW_BYTES / n_planes;
+  const int tile_ip_bytes = BBQ_ROW_BYTES;
+  const int n_tiles       = raft::ceildiv(static_cast<int>(tile_extent), plane_tile);
+
+  for (int i = tx; i < MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES; i += blockDim.x) {
+    s_distances[i] = 0.0f;
+  }
+  __syncthreads();
+
+  for (int step = 0; step < n_tiles; ++step) {
+    const int num_load =
+      (step == n_tiles - 1) ? static_cast<int>(tile_extent) - step * plane_tile : plane_tile;
+#pragma unroll
+    for (int i = 0; i < MAX_NUM_BI_SAMPLES / num_warps; ++i) {
+      const int idx = i * num_warps + warp_id;
+      if (idx < new_size) {
+        const size_t base = static_cast<size_t>(new_neighbors[idx]) * encoded_row_length +
+                            static_cast<size_t>(step) * plane_tile;
+        for (int p = 0; p < n_planes; ++p) {
+          load_vec(s_nv[idx] + p * plane_tile,
+                   codes + base + static_cast<size_t>(p) * tile_extent,
+                   num_load,
+                   plane_tile,
+                   lane_id);
+        }
+      }
+    }
+    __syncthreads();
+
+    for (int i = tx; i < MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES; i += blockDim.x) {
+      const int tmp_row = i / SKEWED_MAX_NUM_BI_SAMPLES;
+      const int tmp_col = i % SKEWED_MAX_NUM_BI_SAMPLES;
+      if (tmp_row < new_size && tmp_col < new_size) {
+        s_distances[i] += cuvs::preprocessing::quantize::bbq::code_inner_product(
+          s_nv[tmp_row], s_nv[tmp_col], dataset.layout, dataset.bits, dataset.dim, tile_ip_bytes);
+      }
+    }
+    __syncthreads();
+  }
+  __syncthreads();
+
   calculate_metric(s_distances,
                    new_neighbors,
                    new_size,
@@ -967,6 +1033,60 @@ RAFT_KERNEL local_join_kernel_bbq(const Index_t* graph_new,
   }
 
   if (!old_size) return;
+  __syncthreads();
+
+  for (int i = tx; i < MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES; i += blockDim.x) {
+    s_distances[i] = 0.0f;
+  }
+  __syncthreads();
+
+  for (int step = 0; step < n_tiles; ++step) {
+    const int num_load =
+      (step == n_tiles - 1) ? static_cast<int>(tile_extent) - step * plane_tile : plane_tile;
+    if (n_tiles > 1) {
+#pragma unroll
+      for (int i = 0; i < MAX_NUM_BI_SAMPLES / num_warps; ++i) {
+        const int idx = i * num_warps + warp_id;
+        if (idx < new_size) {
+          const size_t base = static_cast<size_t>(new_neighbors[idx]) * encoded_row_length +
+                              static_cast<size_t>(step) * plane_tile;
+          for (int p = 0; p < n_planes; ++p) {
+            load_vec(s_nv[idx] + p * plane_tile,
+                     codes + base + static_cast<size_t>(p) * tile_extent,
+                     num_load,
+                     plane_tile,
+                     lane_id);
+          }
+        }
+      }
+    }
+#pragma unroll
+    for (int i = 0; i < MAX_NUM_BI_SAMPLES / num_warps; ++i) {
+      const int idx = i * num_warps + warp_id;
+      if (idx < old_size) {
+        const size_t base = static_cast<size_t>(old_neighbors[idx]) * encoded_row_length +
+                            static_cast<size_t>(step) * plane_tile;
+        for (int p = 0; p < n_planes; ++p) {
+          load_vec(s_ov[idx] + p * plane_tile,
+                   codes + base + static_cast<size_t>(p) * tile_extent,
+                   num_load,
+                   plane_tile,
+                   lane_id);
+        }
+      }
+    }
+    __syncthreads();
+
+    for (int i = tx; i < MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES; i += blockDim.x) {
+      const int tmp_row = i / SKEWED_MAX_NUM_BI_SAMPLES;
+      const int tmp_col = i % SKEWED_MAX_NUM_BI_SAMPLES;
+      if (tmp_row < new_size && tmp_col < old_size) {
+        s_distances[i] += cuvs::preprocessing::quantize::bbq::code_inner_product(
+          s_nv[tmp_row], s_ov[tmp_col], dataset.layout, dataset.bits, dataset.dim, tile_ip_bytes);
+      }
+    }
+    __syncthreads();
+  }
   __syncthreads();
 
   calculate_metric(s_distances,
