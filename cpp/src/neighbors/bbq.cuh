@@ -65,8 +65,6 @@ __device__ __forceinline__ int64_t code_inner_product_binary(const uint8_t* row_
   for (; i < n_bytes; ++i) {
     result += __popc(static_cast<unsigned>(row_a[i] & row_b[i]));
   }
-  // If dim is not a multiple of 8, clear unused high bits in the last byte
-  // before ANDing, or mask the last popc: bits_in_last = dim % 8.
   return result;
 }
 
@@ -83,8 +81,6 @@ __device__ __forceinline__ int64_t code_inner_product_dibit_symmetric(const uint
   return r;
 }
 
-/** Symmetric I_xy for transposeHalfByte (4 bit-planes): sum_i sum_j popcount(A_i & B_j) << (i+j).
- */
 __device__ __forceinline__ int64_t code_inner_product_int4_transposeHalfByte_symmetric(
   const uint8_t* row_a, const uint8_t* row_b, size_t n_bytes)
 {
@@ -100,7 +96,7 @@ __device__ __forceinline__ int64_t code_inner_product_int4_transposeHalfByte_sym
   return result;
 }
 
-/** Symmetric I_xy for packNibbles (Lucene int4DotProductBothPacked). */
+/** Symmetric for packNibbles (Lucene int4DotProductBothPacked). */
 __device__ __forceinline__ int64_t code_inner_product_int4_packed_nibble_symmetric(
   const uint8_t* row_a, const uint8_t* row_b, size_t n_bytes)
 {
