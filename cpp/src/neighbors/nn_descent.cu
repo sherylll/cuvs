@@ -15,7 +15,7 @@ namespace cuvs::neighbors::nn_descent {
 
 auto build(raft::resources const& res,
            index_params const& params,
-           cuvs::preprocessing::quantize::bbq::bbq_dataset_view dataset,
+           cuvs::neighbors::device_bbq_dataset_view<int64_t> dataset,
            std::optional<raft::host_matrix_view<uint32_t, int64_t, raft::row_major>> graph)
   -> index<uint32_t>
 {

@@ -574,7 +574,7 @@ __device__ __forceinline__ void calculate_metric(
   int list_row_size,
   Index_t* col_neighbors,
   int list_col_size,
-  const cuvs::preprocessing::quantize::bbq::bbq_dataset_view& data,
+  const cuvs::neighbors::device_bbq_dataset_storage_view<int64_t>& data,
   DistData_t* l2_norms,
   cuvs::distance::DistanceType metric,
   DistEpilogue_t dist_epilogue)
@@ -601,8 +601,8 @@ __device__ __forceinline__ void calculate_metric(
         s_distances[i] = -cuvs::preprocessing::quantize::bbq::dot_product(data, centered, row, col);
       } else if (metric == cuvs::distance::DistanceType::CosineExpanded) {
         const float norm_product = l2_norms[row] * l2_norms[col];
-        const float dot = cuvs::preprocessing::quantize::bbq::dot_product(data, centered, row, col);
-        s_distances[i]  = norm_product > 0.0f ? 1.0f - dot / sqrtf(norm_product) : 0.0f;
+        s_distances[i]           = cuvs::preprocessing::quantize::bbq::cosine_distance(
+          data, centered, row, col, norm_product);
       }
       s_distances[i] = dist_epilogue(s_distances[i], row, col);
     } else {
@@ -894,23 +894,43 @@ __launch_bounds__(BLOCK_SIZE)
   }
 #endif
 }
-
 template <typename Index_t, typename ID_t = InternalID_t<Index_t>, typename DistEpilogue_t>
-RAFT_KERNEL local_join_kernel_bbq(const Index_t* graph_new,
-                                  const Index_t* rev_graph_new,
-                                  const int2* sizes_new,
-                                  const Index_t* graph_old,
-                                  const Index_t* rev_graph_old,
-                                  const int2* sizes_old,
-                                  const int width,
-                                  cuvs::preprocessing::quantize::bbq::bbq_dataset_view dataset,
-                                  ID_t* graph,
-                                  DistData_t* dists,
-                                  int graph_width,
-                                  int* locks,
-                                  DistData_t* l2_norms,
-                                  cuvs::distance::DistanceType metric,
-                                  DistEpilogue_t dist_epilogue)
+RAFT_KERNEL local_join_kernel_bbq_asymmetric(
+  const Index_t* /*graph_new*/,
+  const Index_t* /*rev_graph_new*/,
+  const int2* /*sizes_new*/,
+  const Index_t* /*graph_old*/,
+  const Index_t* /*rev_graph_old*/,
+  const int2* /*sizes_old*/,
+  const int /*width*/,
+  cuvs::neighbors::device_bbq_dataset_view<int64_t>::view_storage_type /*dataset_storage_query*/,
+  cuvs::neighbors::device_bbq_dataset_view<int64_t>::view_storage_type /*dataset_storage_document*/,
+  ID_t* /*graph*/,
+  DistData_t* /*dists*/,
+  int /*graph_width*/,
+  int* /*locks*/,
+  DistData_t* /*l2_norms*/,
+  cuvs::distance::DistanceType /*metric*/,
+  DistEpilogue_t /*dist_epilogue*/)
+{
+}
+template <typename Index_t, typename ID_t = InternalID_t<Index_t>, typename DistEpilogue_t>
+RAFT_KERNEL local_join_kernel_bbq_symmetric(
+  const Index_t* graph_new,
+  const Index_t* rev_graph_new,
+  const int2* sizes_new,
+  const Index_t* graph_old,
+  const Index_t* rev_graph_old,
+  const int2* sizes_old,
+  const int width,
+  cuvs::neighbors::device_bbq_dataset_view<int64_t>::view_storage_type dataset,
+  ID_t* graph,
+  DistData_t* dists,
+  int graph_width,
+  int* locks,
+  DistData_t* l2_norms,
+  cuvs::distance::DistanceType metric,
+  DistEpilogue_t dist_epilogue)
 {
   constexpr int BBQ_ROW_BYTES = 128;
   constexpr int BBQ_PAD       = 4;
@@ -956,12 +976,13 @@ RAFT_KERNEL local_join_kernel_bbq(const Index_t* graph_new,
   new_size = new_size2.x + s_unique_counter[0];
   old_size = old_size2.x + s_unique_counter[1];
 
-  const int warp_id               = threadIdx.x / raft::warp_size();
-  const int lane_id               = threadIdx.x % raft::warp_size();
-  constexpr int num_warps         = BLOCK_SIZE / raft::warp_size();
-  const uint8_t* codes            = dataset.codes.data_handle();
-  const size_t encoded_row_length = dataset.encoded_row_length();
-  const int n_planes              = [](cuvs::preprocessing::quantize::bbq::code_layout layout) {
+  const int warp_id       = threadIdx.x / raft::warp_size();
+  const int lane_id       = threadIdx.x % raft::warp_size();
+  constexpr int num_warps = BLOCK_SIZE / raft::warp_size();
+  const uint8_t* codes    = dataset.codes.data_handle();
+  const size_t encoded_row_length =
+    cuvs::preprocessing::quantize::bbq::get_encoded_row_length(dataset);
+  const int n_planes = [](cuvs::preprocessing::quantize::bbq::code_layout layout) {
     if (layout == cuvs::preprocessing::quantize::bbq::code_layout::dibit) { return 2; }
     if (layout == cuvs::preprocessing::quantize::bbq::code_layout::transpose_half_byte) {
       return 4;
@@ -1005,7 +1026,7 @@ RAFT_KERNEL local_join_kernel_bbq(const Index_t* graph_new,
       const int tmp_col = i % SKEWED_MAX_NUM_BI_SAMPLES;
       if (tmp_row < new_size && tmp_col < new_size) {
         s_distances[i] += cuvs::preprocessing::quantize::bbq::code_inner_product(
-          s_nv[tmp_row], s_nv[tmp_col], dataset.layout, dataset.bits, dataset.dim, tile_ip_bytes);
+          s_nv[tmp_row], s_nv[tmp_col], dataset.layout, dataset.bits, dataset.dim(), tile_ip_bytes);
       }
     }
     __syncthreads();
@@ -1082,7 +1103,7 @@ RAFT_KERNEL local_join_kernel_bbq(const Index_t* graph_new,
       const int tmp_col = i % SKEWED_MAX_NUM_BI_SAMPLES;
       if (tmp_row < new_size && tmp_col < old_size) {
         s_distances[i] += cuvs::preprocessing::quantize::bbq::code_inner_product(
-          s_nv[tmp_row], s_ov[tmp_col], dataset.layout, dataset.bits, dataset.dim, tile_ip_bytes);
+          s_nv[tmp_row], s_ov[tmp_col], dataset.layout, dataset.bits, dataset.dim(), tile_ip_bytes);
       }
     }
     __syncthreads();
@@ -1775,25 +1796,65 @@ void GNND<Data_t, Index_t>::local_join(cudaStream_t stream, DistEpilogue_t dist_
 template <typename Data_t, typename Index_t>
 template <typename DistEpilogue_t>
 void GNND<Data_t, Index_t>::local_join(cudaStream_t stream,
-                                       cuvs::preprocessing::quantize::bbq::bbq_dataset_view dataset,
+                                       cuvs::neighbors::device_bbq_dataset_view<int64_t> dataset,
                                        DistEpilogue_t dist_epilogue)
 {
+  namespace bbq = cuvs::preprocessing::quantize::bbq;
   raft::matrix::fill(res, dists_buffer_.view(), std::numeric_limits<float>::max());
-  local_join_kernel_bbq<<<nrow_, BLOCK_SIZE, 0, stream>>>(graph_.h_graph_new.data_handle(),
-                                                          h_rev_graph_new_.data_handle(),
-                                                          d_list_sizes_new_.data_handle(),
-                                                          h_graph_old_.data_handle(),
-                                                          h_rev_graph_old_.data_handle(),
-                                                          d_list_sizes_old_.data_handle(),
-                                                          NUM_SAMPLES,
-                                                          dataset,
-                                                          graph_buffer_.data_handle(),
-                                                          dists_buffer_.data_handle(),
-                                                          DEGREE_ON_DEVICE,
-                                                          d_locks_.data_handle(),
-                                                          l2_norms_.data_handle(),
-                                                          build_config_.metric,
-                                                          dist_epilogue);
+  const bool has_single_bit = dataset.has_bit_and_layout(1, bbq::code_layout::single_bit);
+  const bool has_dibit      = dataset.has_bit_and_layout(2, bbq::code_layout::dibit);
+  const bool has_transpose_half_byte =
+    dataset.has_bit_and_layout(4, bbq::code_layout::transpose_half_byte);
+  bool use_asymmetric = false;
+  if (dataset.storage_size() > 1) {
+    if ((has_single_bit && has_dibit) || (has_single_bit && has_transpose_half_byte) ||
+        (has_dibit && has_transpose_half_byte)) {
+      use_asymmetric = true;
+    }
+  }
+  if (use_asymmetric) {
+    auto dataset_storage_query =
+      has_transpose_half_byte ? dataset.get_storage_view(4, bbq::code_layout::transpose_half_byte)
+                              : dataset.get_storage_view(2, bbq::code_layout::dibit);
+    auto dataset_storage_document = has_single_bit
+                                      ? dataset.get_storage_view(1, bbq::code_layout::single_bit)
+                                      : dataset.get_storage_view(2, bbq::code_layout::dibit);
+    local_join_kernel_bbq_asymmetric<<<nrow_, BLOCK_SIZE, 0, stream>>>(
+      graph_.h_graph_new.data_handle(),
+      h_rev_graph_new_.data_handle(),
+      d_list_sizes_new_.data_handle(),
+      h_graph_old_.data_handle(),
+      h_rev_graph_old_.data_handle(),
+      d_list_sizes_old_.data_handle(),
+      NUM_SAMPLES,
+      dataset_storage_query,
+      dataset_storage_document,
+      graph_buffer_.data_handle(),
+      dists_buffer_.data_handle(),
+      DEGREE_ON_DEVICE,
+      d_locks_.data_handle(),
+      l2_norms_.data_handle(),
+      build_config_.metric,
+      dist_epilogue);
+  } else {
+    auto dataset_storage = dataset.get_front_storage_view();
+    local_join_kernel_bbq_symmetric<<<nrow_, BLOCK_SIZE, 0, stream>>>(
+      graph_.h_graph_new.data_handle(),
+      h_rev_graph_new_.data_handle(),
+      d_list_sizes_new_.data_handle(),
+      h_graph_old_.data_handle(),
+      h_rev_graph_old_.data_handle(),
+      d_list_sizes_old_.data_handle(),
+      NUM_SAMPLES,
+      dataset_storage,
+      graph_buffer_.data_handle(),
+      dists_buffer_.data_handle(),
+      DEGREE_ON_DEVICE,
+      d_locks_.data_handle(),
+      l2_norms_.data_handle(),
+      build_config_.metric,
+      dist_epilogue);
+  }
   RAFT_CUDA_TRY(cudaPeekAtLastError());
 }
 
@@ -2084,7 +2145,7 @@ void GNND<Data_t, Index_t>::build(Data_t* data,
 
 template <typename Data_t, typename Index_t>
 template <typename DistEpilogue_t>
-void GNND<Data_t, Index_t>::build(cuvs::preprocessing::quantize::bbq::bbq_dataset_view dataset,
+void GNND<Data_t, Index_t>::build(cuvs::neighbors::device_bbq_dataset_view<int64_t> dataset,
                                   Index_t* output_graph,
                                   bool return_distances,
                                   DistData_t* output_distances,
@@ -2098,8 +2159,9 @@ void GNND<Data_t, Index_t>::build(cuvs::preprocessing::quantize::bbq::bbq_datase
   graph_.h_graph  = reinterpret_cast<InternalID_t<Index_t>*>(output_graph);
 
   if (build_config_.metric == cuvs::distance::DistanceType::CosineExpanded) {
+    auto front_storage = dataset.get_front_storage_view();
     raft::linalg::map_offset(res, l2_norms_.view(), [=] __device__(size_t row) {
-      return cuvs::preprocessing::quantize::bbq::row_norm(dataset, static_cast<int64_t>(row));
+      return cuvs::preprocessing::quantize::bbq::row_norm(front_storage, static_cast<int64_t>(row));
     });
   }
 
@@ -2214,52 +2276,38 @@ void GNND<Data_t, Index_t>::build(cuvs::preprocessing::quantize::bbq::bbq_datase
   }
 }
 
-inline void validate_bbq_dataset(
-  const cuvs::preprocessing::quantize::bbq::bbq_dataset_view& dataset,
-  cuvs::distance::DistanceType metric)
-{
-  const auto n_rows = static_cast<int64_t>(dataset.n_rows());
-  RAFT_EXPECTS(dataset.bits >= 1 && dataset.bits <= 8, "BBQ bits must be in [1, 8].");
-  RAFT_EXPECTS(dataset.dim > 0, "BBQ dimension must be positive.");
-  RAFT_EXPECTS(dataset.encoded_row_length() > 0, "Unsupported BBQ code layout.");
-  RAFT_EXPECTS(dataset.codes.extent(1) == static_cast<int64_t>(dataset.encoded_row_length()),
-               "BBQ code row width does not match dim, bits, and layout.");
-  RAFT_EXPECTS(dataset.lower_intervals.extent(0) == n_rows &&
-                 dataset.upper_intervals.extent(0) == n_rows &&
-                 dataset.additional_corrections.extent(0) == n_rows &&
-                 dataset.quantized_component_sums.extent(0) == n_rows,
-               "Every BBQ correction array must contain one value per row.");
-  RAFT_EXPECTS(dataset.centroid.extent(0) == static_cast<int64_t>(dataset.dim),
-               "BBQ centroid length must equal the logical dimension.");
-  RAFT_EXPECTS(metric == cuvs::distance::DistanceType::L2Expanded ||
-                 metric == cuvs::distance::DistanceType::L2SqrtExpanded ||
-                 metric == cuvs::distance::DistanceType::CosineExpanded ||
-                 metric == cuvs::distance::DistanceType::InnerProduct,
-               "BBQ NN-Descent supports L2Expanded, L2SqrtExpanded, CosineExpanded, and "
-               "InnerProduct.");
-  RAFT_EXPECTS(metric == dataset.metric,
-               "BBQ dataset metric does not match the NN-Descent metric.");
-}
-
 template <typename IdxT = uint32_t>
 void build(raft::resources const& res,
            const index_params& params,
-           cuvs::preprocessing::quantize::bbq::bbq_dataset_view dataset,
+           cuvs::neighbors::device_bbq_dataset_view<int64_t> dataset,
            index<IdxT>& idx)
 {
+  auto front_storage = dataset.get_front_storage_view();
   cuvs::common::nvtx::range<cuvs::common::nvtx::domain::cuvs> fun_scope(
     "neighbors::nn_descent::detail::build-bbq(%zu, %zu, %zu, %zu, %zu)",
     size_t(dataset.n_rows()),
-    size_t(dataset.dim),
+    size_t(dataset.dim()),
     size_t(idx.graph().extent(1)),
     size_t(idx.metric()),
-    size_t(dataset.bits));
-  validate_bbq_dataset(dataset, idx.metric());
+    size_t(front_storage.bits));
+  RAFT_EXPECTS(idx.metric() == cuvs::distance::DistanceType::L2Expanded ||
+                 idx.metric() == cuvs::distance::DistanceType::L2SqrtExpanded ||
+                 idx.metric() == cuvs::distance::DistanceType::CosineExpanded ||
+                 idx.metric() == cuvs::distance::DistanceType::InnerProduct,
+               "BBQ NN-Descent supports L2Expanded, L2SqrtExpanded, CosineExpanded, and "
+               "InnerProduct.");
+  RAFT_EXPECTS(idx.metric() == front_storage.metric,
+               "BBQ dataset metric does not match the NN-Descent metric.");
 
   size_t extended_graph_degree;
   size_t graph_degree;
-  auto build_config = get_build_config(
-    res, params, dataset.n_rows(), dataset.dim, idx.metric(), extended_graph_degree, graph_degree);
+  auto build_config = get_build_config(res,
+                                       params,
+                                       dataset.n_rows(),
+                                       dataset.dim(),
+                                       idx.metric(),
+                                       extended_graph_degree,
+                                       graph_degree);
   auto int_graph =
     raft::make_host_matrix<int, int64_t, raft::row_major>(dataset.n_rows(), extended_graph_degree);
   GNND<const uint8_t, int> nnd(res, build_config);
@@ -2278,7 +2326,7 @@ void build(raft::resources const& res,
   }
 
 #pragma omp parallel for
-  for (size_t i = 0; i < dataset.n_rows(); ++i) {
+  for (size_t i = 0; i < static_cast<size_t>(dataset.n_rows()); ++i) {
     for (size_t j = 0; j < graph_degree; ++j) {
       idx.graph()(i, j) = int_graph(i, j);
     }
@@ -2346,7 +2394,7 @@ void build(raft::resources const& res,
 template <typename IdxT = uint32_t>
 index<IdxT> build(raft::resources const& res,
                   const index_params& params,
-                  cuvs::preprocessing::quantize::bbq::bbq_dataset_view dataset)
+                  cuvs::neighbors::device_bbq_dataset_view<int64_t> dataset)
 {
   size_t graph_degree = params.graph_degree;
   if (params.intermediate_graph_degree < graph_degree) {

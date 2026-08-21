@@ -19,6 +19,27 @@ namespace preprocessing::quantize::bbq {
 
 #ifdef __CUDACC__
 
+_RAFT_HOST_DEVICE constexpr uint32_t get_encoded_row_length(const bbq::code_layout layout,
+                                                            const uint32_t bits,
+                                                            const uint32_t dim)
+{
+  switch (layout) {
+    case code_layout::single_bit: return (dim * bits + 7) / 8;
+    case code_layout::dibit: return bits * ((dim + 7) / 8);
+    case code_layout::packed_nibble: return (dim + 1) / 2;
+    case code_layout::seven_bit: return dim;
+    case code_layout::unsigned_byte: return dim;
+    case code_layout::transpose_half_byte: return 4 * ((dim + 7) / 8);
+  }
+  return 0;
+}
+
+_RAFT_HOST_DEVICE constexpr uint32_t get_encoded_row_length(
+  const cuvs::neighbors::device_bbq_dataset_storage_view<int64_t>& dataset)
+{
+  return get_encoded_row_length(dataset.layout, dataset.bits, dataset.dim());
+}
+
 __device__ __forceinline__ uint32_t get_code(const uint8_t* row,
                                              size_t d,
                                              const bbq::code_layout layout,
@@ -155,19 +176,21 @@ __device__ __forceinline__ int64_t code_inner_product(const uint8_t* row_a,
   }
 }
 /** Integer inner product between two encoded rows. */
-__device__ __forceinline__ int64_t code_inner_product(const uint8_t* row_a,
-                                                      const uint8_t* row_b,
-                                                      const bbq_dataset_view& dataset)
+__device__ __forceinline__ int64_t
+code_inner_product(const uint8_t* row_a,
+                   const uint8_t* row_b,
+                   const cuvs::neighbors::device_bbq_dataset_storage_view<int64_t>& dataset)
 {
   return code_inner_product(
-    row_a, row_b, dataset.layout, dataset.bits, dataset.dim, dataset.encoded_row_length());
+    row_a, row_b, dataset.layout, dataset.bits, dataset.dim(), get_encoded_row_length(dataset));
 }
 
 /** Centered dot product of two rows. */
-__device__ __forceinline__ float centered_dot(const bbq_dataset_view& dataset,
-                                              float code_ip,
-                                              int64_t row_a,
-                                              int64_t row_b)
+__device__ __forceinline__ float centered_dot(
+  const cuvs::neighbors::device_bbq_dataset_storage_view<int64_t>& dataset,
+  float code_ip,
+  int64_t row_a,
+  int64_t row_b)
 {
   const float lower_a = dataset.lower_intervals(row_a);
   const float lower_b = dataset.lower_intervals(row_b);
@@ -177,58 +200,85 @@ __device__ __forceinline__ float centered_dot(const bbq_dataset_view& dataset,
   const float sum_a   = static_cast<float>(dataset.quantized_component_sums(row_a));
   const float sum_b   = static_cast<float>(dataset.quantized_component_sums(row_b));
 
-  return static_cast<float>(dataset.dim) * lower_a * lower_b + lower_b * delta_a * sum_a +
+  return static_cast<float>(dataset.dim()) * lower_a * lower_b + lower_b * delta_a * sum_a +
          lower_a * delta_b * sum_b + delta_a * delta_b * code_ip;
 }
 
 /** Centered dot product. */
-__device__ __forceinline__ float centered_dot(const bbq_dataset_view& dataset,
-                                              int64_t row_a,
-                                              int64_t row_b)
+__device__ __forceinline__ float centered_dot(
+  const cuvs::neighbors::device_bbq_dataset_storage_view<int64_t>& dataset,
+  int64_t row_a,
+  int64_t row_b)
 {
-  const uint8_t* codes_a = dataset.codes.data_handle() + row_a * dataset.encoded_row_length();
-  const uint8_t* codes_b = dataset.codes.data_handle() + row_b * dataset.encoded_row_length();
+  const uint8_t* codes_a = dataset.codes.data_handle() + row_a * get_encoded_row_length(dataset);
+  const uint8_t* codes_b = dataset.codes.data_handle() + row_b * get_encoded_row_length(dataset);
   return centered_dot(
     dataset, static_cast<float>(code_inner_product(codes_a, codes_b, dataset)), row_a, row_b);
 }
 
 // Dot product overload when the centered dot product is already computed
-__device__ __forceinline__ float dot_product(const bbq_dataset_view& dataset,
-                                             float centered_dot_value,
-                                             int64_t row_a,
-                                             int64_t row_b)
+__device__ __forceinline__ float dot_product(
+  const cuvs::neighbors::device_bbq_dataset_storage_view<int64_t>& dataset,
+  float centered_dot_value,
+  int64_t row_a,
+  int64_t row_b)
 {
   return centered_dot_value + dataset.additional_corrections(row_a) +
          dataset.additional_corrections(row_b) - dataset.centroid_norm_sq;
 }
 /** Dot product. */
-__device__ __forceinline__ float dot_product(const bbq_dataset_view& dataset,
-                                             int64_t row_a,
-                                             int64_t row_b)
+__device__ __forceinline__ float dot_product(
+  const cuvs::neighbors::device_bbq_dataset_storage_view<int64_t>& dataset,
+  int64_t row_a,
+  int64_t row_b)
 {
   return dot_product(dataset, centered_dot(dataset, row_a, row_b), row_a, row_b);
 }
 
 /** Squared L2 distance overload when the centered dot product is already computed */
-__device__ __forceinline__ float l2_distance(const bbq_dataset_view& dataset,
-                                             float centered_dot_value,
-                                             int64_t row_a,
-                                             int64_t row_b)
+__device__ __forceinline__ float l2_distance(
+  const cuvs::neighbors::device_bbq_dataset_storage_view<int64_t>& dataset,
+  float centered_dot_value,
+  int64_t row_a,
+  int64_t row_b)
 {
   const float distance = dataset.additional_corrections(row_a) +
                          dataset.additional_corrections(row_b) - 2.0f * centered_dot_value;
   return distance < 0.0f ? 0.0f : distance;
 }
 /** Squared L2 distance. */
-__device__ __forceinline__ float l2_distance(const bbq_dataset_view& dataset,
-                                             int64_t row_a,
-                                             int64_t row_b)
+__device__ __forceinline__ float l2_distance(
+  const cuvs::neighbors::device_bbq_dataset_storage_view<int64_t>& dataset,
+  int64_t row_a,
+  int64_t row_b)
 {
   return l2_distance(dataset, centered_dot(dataset, row_a, row_b), row_a, row_b);
 }
 
+__device__ __forceinline__ float cosine_distance(
+  const cuvs::neighbors::device_bbq_dataset_storage_view<int64_t>& dataset,
+  float centered_dot_value,
+  int64_t row_a,
+  int64_t row_b,
+  float norm_product)
+{
+  const auto dot = dot_product(dataset, centered_dot_value, row_a, row_b);
+  return norm_product > 0.0f ? 1.0f - dot / sqrtf(norm_product) : 0.0f;
+}
+
+// norm_product = norm_a * norm_b
+__device__ __forceinline__ float cosine_distance(
+  const cuvs::neighbors::device_bbq_dataset_storage_view<int64_t>& dataset,
+  int64_t row_a,
+  int64_t row_b,
+  float norm_product)
+{
+  return cosine_distance(dataset, centered_dot(dataset, row_a, row_b), row_a, row_b, norm_product);
+}
+
 /** Squared norm of one original-space row. */
-__device__ __forceinline__ float row_norm(const bbq_dataset_view& dataset, int64_t row)
+__device__ __forceinline__ float row_norm(
+  const cuvs::neighbors::device_bbq_dataset_storage_view<int64_t>& dataset, int64_t row)
 {
   const float norm = dot_product(dataset, row, row);
   return norm < 0.0f ? 0.0f : norm;
