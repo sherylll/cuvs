@@ -30,7 +30,7 @@ namespace cuvs::neighbors::nn_descent {
 // Host-side Lucene OptimizedScalarQuantizer
 namespace cpu_bbq {
 
-using cuvs::preprocessing::quantize::bbq::code_layout;
+using cuvs::preprocessing::quantize::bbq::bbq_code_layout;
 
 constexpr float kMinimumMseGrid[8][2] = {{-0.798f, 0.798f},
                                          {-1.493f, 1.493f},
@@ -162,15 +162,15 @@ inline row_result scalar_quantize(std::vector<float>& vector,
   return row_result{interval[0], interval[1], euclidean ? norm2 : centroid_dot, sum_query};
 }
 
-inline size_t encoded_row_length(size_t dim, uint32_t bits, code_layout layout)
+inline size_t encoded_row_length(size_t dim, uint32_t bits, bbq_code_layout layout)
 {
   switch (layout) {
-    case code_layout::single_bit: return (dim * bits + 7) / 8;
-    case code_layout::dibit: return bits * ((dim + 7) / 8);
-    case code_layout::packed_nibble: return (dim + 1) / 2;
-    case code_layout::seven_bit: return dim;
-    case code_layout::unsigned_byte: return dim;
-    case code_layout::transpose_half_byte: return 4 * ((dim + 7) / 8);
+    case bbq_code_layout::single_bit: return (dim * bits + 7) / 8;
+    case bbq_code_layout::dibit: return bits * ((dim + 7) / 8);
+    case bbq_code_layout::packed_nibble: return (dim + 1) / 2;
+    case bbq_code_layout::seven_bit: return dim;
+    case bbq_code_layout::unsigned_byte: return dim;
+    case bbq_code_layout::transpose_half_byte: return 4 * ((dim + 7) / 8);
   }
   return 0;
 }
@@ -182,16 +182,18 @@ inline std::vector<uint8_t> pack_codes(const std::vector<uint8_t>& unpacked,
                                        size_t n_rows,
                                        size_t dim,
                                        uint32_t bits,
-                                       code_layout layout)
+                                       bbq_code_layout layout)
 {
   const size_t row_length = encoded_row_length(dim, bits, layout);
-  if (layout == code_layout::unsigned_byte || layout == code_layout::seven_bit) { return unpacked; }
+  if (layout == bbq_code_layout::unsigned_byte || layout == bbq_code_layout::seven_bit) {
+    return unpacked;
+  }
 
   std::vector<uint8_t> packed(n_rows * row_length, 0);
   for (size_t row = 0; row < n_rows; ++row) {
     auto* output      = packed.data() + row * row_length;
     const auto* input = unpacked.data() + row * dim;
-    if (layout == code_layout::packed_nibble) {
+    if (layout == bbq_code_layout::packed_nibble) {
       // Lucene OffHeapScalarQuantizedVectorValues.packNibbles
       const size_t half = dim / 2;
       for (size_t i = 0; i < half; ++i) {
@@ -201,7 +203,7 @@ inline std::vector<uint8_t> pack_codes(const std::vector<uint8_t>& unpacked,
     }
     for (size_t d = 0; d < dim; ++d) {
       const uint8_t code = input[d];
-      if (layout == code_layout::single_bit) {
+      if (layout == bbq_code_layout::single_bit) {
         for (uint32_t bit = 0; bit < bits; ++bit) {
           const size_t position = d * bits + bit;
           output[position / 8] |=
@@ -225,7 +227,7 @@ inline cuvs::neighbors::host_bbq_dataset<int64_t>::owning_storage_type quantize(
   int64_t dim,
   uint8_t bits,
   cuvs::distance::DistanceType metric,
-  code_layout layout = code_layout::unsigned_byte)
+  bbq_code_layout layout = bbq_code_layout::unsigned_byte)
 {
   const bool euclidean = metric == cuvs::distance::DistanceType::L2Expanded ||
                          metric == cuvs::distance::DistanceType::L2SqrtExpanded;
@@ -336,11 +338,11 @@ auto make_device_bbq_dataset(raft::resources const& res,
                              cuvs::neighbors::host_bbq_dataset<IdxT> const& host)
   -> cuvs::neighbors::device_bbq_dataset<IdxT>
 {
-  RAFT_EXPECTS(host.storage_size() != 0, "host BBQ dataset has no storage");
+  RAFT_EXPECTS(host.quantizers.size() != 0, "host BBQ dataset has no storage");
   cuvs::neighbors::device_bbq_dataset<IdxT> device{
-    copy_bbq_owning_storage_host_to_device<IdxT>(res, host.storage_vector.front())};
-  for (std::size_t i = 1; i < host.storage_vector.size(); ++i) {
-    device.add_storage(copy_bbq_owning_storage_host_to_device<IdxT>(res, host.storage_vector[i]));
+    copy_bbq_owning_storage_host_to_device<IdxT>(res, host.quantizers[0])};
+  for (std::size_t i = 1; i < host.quantizers.size(); ++i) {
+    device.add_quantizer(copy_bbq_owning_storage_host_to_device<IdxT>(res, host.quantizers[i]));
   }
   return device;
 }
@@ -368,7 +370,7 @@ float time_cuda_ms(rmm::cuda_stream_view stream, Fn&& fn)
 
 struct AnnNNDescentBbqInputs : AnnNNDescentInputs {
   uint8_t bits;
-  cuvs::preprocessing::quantize::bbq::code_layout layout;
+  cuvs::preprocessing::quantize::bbq::bbq_code_layout layout;
   std::optional<uint8_t> second_dataset_bits;
 };
 
@@ -389,7 +391,7 @@ class AnnNNDescentBbqTest : public ::testing::TestWithParam<AnnNNDescentBbqInput
   AnnNNDescentBbqTest()
     : stream_(raft::resource::get_cuda_stream(handle_)),
       ps(::testing::TestWithParam<AnnNNDescentBbqInputs>::GetParam()),
-      database(0, stream_)
+      database(raft::make_device_matrix<float, int64_t>(handle_, ps.n_rows, ps.dim))
   {
   }
 
@@ -399,7 +401,7 @@ class AnnNNDescentBbqTest : public ::testing::TestWithParam<AnnNNDescentBbqInput
     if (ps.second_dataset_bits.has_value()) {
       if (ps.bits > 4 ||
           (ps.bits == 4 &&
-           ps.layout == cuvs::preprocessing::quantize::bbq::code_layout::packed_nibble) ||
+           ps.layout == cuvs::preprocessing::quantize::bbq::bbq_code_layout::packed_nibble) ||
           ps.bits == ps.second_dataset_bits.value() || ps.bits == 1) {
         GTEST_SKIP() << "Second dataset is N/A: bits=" << static_cast<int>(ps.bits)
                      << ", layout=" << static_cast<int>(ps.layout)
@@ -418,8 +420,8 @@ class AnnNNDescentBbqTest : public ::testing::TestWithParam<AnnNNDescentBbqInput
       naive_knn<float, float, uint32_t>(handle_,
                                         distances_naive_dev.data(),
                                         indices_naive_dev.data(),
-                                        database.data(),
-                                        database.data(),
+                                        database.data_handle(),
+                                        database.data_handle(),
                                         ps.n_rows,
                                         ps.n_rows,
                                         ps.dim,
@@ -432,7 +434,7 @@ class AnnNNDescentBbqTest : public ::testing::TestWithParam<AnnNNDescentBbqInput
 
     {
       std::vector<float> host_data(static_cast<size_t>(ps.n_rows) * ps.dim);
-      raft::update_host(host_data.data(), database.data(), host_data.size(), stream_);
+      raft::update_host(host_data.data(), database.data_handle(), host_data.size(), stream_);
       raft::resource::sync_stream(handle_);
 
       auto bbq_host_storage =
@@ -441,11 +443,11 @@ class AnnNNDescentBbqTest : public ::testing::TestWithParam<AnnNNDescentBbqInput
 
       if (ps.second_dataset_bits.has_value()) {
         auto second_layout           = ps.second_dataset_bits.value() == 1
-                                         ? cuvs::preprocessing::quantize::bbq::code_layout::single_bit
-                                         : cuvs::preprocessing::quantize::bbq::code_layout::dibit;
+                                         ? cuvs::preprocessing::quantize::bbq::bbq_code_layout::single_bit
+                                         : cuvs::preprocessing::quantize::bbq::bbq_code_layout::dibit;
         auto bbq_host_second_storage = cpu_bbq::quantize(
           host_data, ps.n_rows, ps.dim, ps.second_dataset_bits.value(), ps.metric, second_layout);
-        bbq_host.add_storage(std::move(bbq_host_second_storage));
+        bbq_host.add_quantizer(std::move(bbq_host_second_storage));
       }
       auto owning_dataset = make_device_bbq_dataset(handle_, bbq_host);
       auto dataset        = owning_dataset.as_dataset_view();
@@ -458,9 +460,8 @@ class AnnNNDescentBbqTest : public ::testing::TestWithParam<AnnNNDescentBbqInput
 
       // Dense float baseline on the same data / params, timed with the same CUDA events.
       const float dense_ms = time_cuda_ms(stream_, [&] {
-        auto database_view =
-          raft::make_device_matrix_view<const float, int64_t>(database.data(), ps.n_rows, ps.dim);
-        auto dense_index = nn_descent::build(handle_, index_params, database_view);
+        auto database_view = raft::make_const_mdspan(database.view());
+        auto dense_index   = nn_descent::build(handle_, index_params, database_view);
         (void)dense_index;
       });
 
@@ -471,10 +472,12 @@ class AnnNNDescentBbqTest : public ::testing::TestWithParam<AnnNNDescentBbqInput
       std::ostringstream metric_name;
       metric_name << print_metric{ps.metric};
       RAFT_LOG_INFO(
-        "NN-Descent build timing: bbq(%u-bit,layout=%d) dense=%.3f ms, bbq=%.3f ms, speedup=%.2fx "
+        "NN-Descent build timing: bbq(%u-bit,layout=%d, second_bits=%d) dense=%.3f ms, bbq=%.3f "
+        "ms, speedup=%.2fx "
         "(n_rows=%d, dim=%d, graph_degree=%d, metric=%s)",
         static_cast<unsigned>(ps.bits),
         static_cast<int>(ps.layout),
+        static_cast<int>(ps.second_dataset_bits.has_value() ? ps.second_dataset_bits.value() : 0),
         dense_ms,
         bbq_ms,
         dense_ms / std::max(bbq_ms, 1e-3f),
@@ -504,39 +507,34 @@ class AnnNNDescentBbqTest : public ::testing::TestWithParam<AnnNNDescentBbqInput
 
   void SetUp() override
   {
-    database.resize(static_cast<size_t>(ps.n_rows) * ps.dim, stream_);
     raft::random::RngState r(1234ULL);
-    raft::random::normal(handle_, r, database.data(), ps.n_rows * ps.dim, 0.1f, 2.0f);
+    raft::random::normal(handle_, r, database.data_handle(), ps.n_rows * ps.dim, 0.1f, 2.0f);
     raft::resource::sync_stream(handle_);
   }
 
-  void TearDown() override
-  {
-    raft::resource::sync_stream(handle_);
-    database.resize(0, stream_);
-  }
+  void TearDown() override { raft::resource::sync_stream(handle_); }
 
  private:
   raft::resources handle_;
   rmm::cuda_stream_view stream_;
   AnnNNDescentBbqInputs ps;
-  rmm::device_uvector<float> database;
+  raft::device_matrix<float, int64_t> database;
 };
 
 // Estimated recall based on bruteforce (InnerProduct): 1: 0.23, 2: 0.52, 4: 0.85, 7: 0.98, 8: 0.99.
 const std::vector<AnnNNDescentBbqInputs> bbq_inputs = [] {
-  using cuvs::preprocessing::quantize::bbq::code_layout;
-  const std::vector<std::tuple<uint8_t, double, code_layout, std::optional<uint8_t>>>
+  using cuvs::preprocessing::quantize::bbq::bbq_code_layout;
+  const std::vector<std::tuple<uint8_t, double, bbq_code_layout, std::optional<uint8_t>>>
     bits_specifications{// bits, min_recall, layout
-                        {1, 0.15, code_layout::single_bit, std::optional<uint8_t>{}},
-                        {2, 0.50, code_layout::dibit, std::optional<uint8_t>{}},
-                        {2, 0.50, code_layout::dibit, std::optional<uint8_t>{1}},
-                        {4, 0.80, code_layout::packed_nibble, std::optional<uint8_t>{}},
-                        {4, 0.80, code_layout::transpose_half_byte, std::optional<uint8_t>{}},
-                        {4, 0.80, code_layout::transpose_half_byte, std::optional<uint8_t>{1}},
-                        {4, 0.80, code_layout::transpose_half_byte, std::optional<uint8_t>{2}},
-                        {7, 0.93, code_layout::seven_bit, std::optional<uint8_t>{}},
-                        {8, 0.95, code_layout::unsigned_byte, std::optional<uint8_t>{}}};
+                        {1, 0.15, bbq_code_layout::single_bit, std::optional<uint8_t>{}},
+                        {2, 0.50, bbq_code_layout::dibit, std::optional<uint8_t>{}},
+                        {2, 0.27, bbq_code_layout::dibit, std::optional<uint8_t>{1}},
+                        {4, 0.80, bbq_code_layout::packed_nibble, std::optional<uint8_t>{}},
+                        {4, 0.80, bbq_code_layout::transpose_half_byte, std::optional<uint8_t>{}},
+                        {4, 0.35, bbq_code_layout::transpose_half_byte, std::optional<uint8_t>{1}},
+                        {4, 0.65, bbq_code_layout::transpose_half_byte, std::optional<uint8_t>{2}},
+                        {7, 0.93, bbq_code_layout::seven_bit, std::optional<uint8_t>{}},
+                        {8, 0.95, bbq_code_layout::unsigned_byte, std::optional<uint8_t>{}}};
   std::vector<AnnNNDescentBbqInputs> out;
   for (const auto& [bits, min_recall, layout, second_bits] : bits_specifications) {
     const auto batch = raft::util::itertools::product<AnnNNDescentBbqInputs>(

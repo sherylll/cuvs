@@ -7,6 +7,7 @@
 
 #include <cuvs/core/export.hpp>
 #include <cuvs/distance/distance.hpp>
+#include <cuvs/neighbors/common.hpp>
 #include <cuvs/preprocessing/quantize/bbq.hpp>
 
 #include <raft/core/device_mdspan.hpp>
@@ -19,37 +20,34 @@ namespace preprocessing::quantize::bbq {
 
 #ifdef __CUDACC__
 
-_RAFT_HOST_DEVICE constexpr uint32_t get_encoded_row_length(const bbq::code_layout layout,
+_RAFT_HOST_DEVICE constexpr uint32_t get_encoded_row_length(const bbq_code_layout layout,
                                                             const uint32_t bits,
                                                             const uint32_t dim)
 {
   switch (layout) {
-    case code_layout::single_bit: return (dim * bits + 7) / 8;
-    case code_layout::dibit: return bits * ((dim + 7) / 8);
-    case code_layout::packed_nibble: return (dim + 1) / 2;
-    case code_layout::seven_bit: return dim;
-    case code_layout::unsigned_byte: return dim;
-    case code_layout::transpose_half_byte: return 4 * ((dim + 7) / 8);
+    case bbq_code_layout::single_bit: return (dim * bits + 7) / 8;
+    case bbq_code_layout::dibit: return bits * ((dim + 7) / 8);
+    case bbq_code_layout::packed_nibble: return (dim + 1) / 2;
+    case bbq_code_layout::seven_bit: return dim;
+    case bbq_code_layout::unsigned_byte: return dim;
+    case bbq_code_layout::transpose_half_byte: return 4 * ((dim + 7) / 8);
   }
   return 0;
 }
 
+template <typename DataT, typename IdxT, typename Accessor>
 _RAFT_HOST_DEVICE constexpr uint32_t get_encoded_row_length(
-  const cuvs::neighbors::device_bbq_dataset_storage_view<int64_t>& dataset)
+  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset)
 {
   return get_encoded_row_length(dataset.layout, dataset.bits, dataset.dim());
 }
-
-__device__ __forceinline__ uint32_t get_code(const uint8_t* row,
-                                             size_t d,
-                                             const bbq::code_layout layout,
-                                             const uint32_t bits,
-                                             const size_t dim)
+__device__ __forceinline__ uint32_t get_code(
+  const uint8_t* row, size_t d, const bbq_code_layout layout, const uint32_t bits, const size_t dim)
 {
   const uint32_t mask = (uint32_t{1} << bits) - 1;
-  if (layout == code_layout::seven_bit || layout == code_layout::unsigned_byte) {
+  if (layout == bbq_code_layout::seven_bit || layout == bbq_code_layout::unsigned_byte) {
     return row[d] & mask;
-  } else if (layout == code_layout::packed_nibble) {
+  } else if (layout == bbq_code_layout::packed_nibble) {
     // Lucene unpackNibbles: high nibble = dims [0, half), low = [half, dim)
     const size_t half = dim / 2;
     if (d < half) {
@@ -57,7 +55,7 @@ __device__ __forceinline__ uint32_t get_code(const uint8_t* row,
     } else {
       return row[d - half] & 0x0Fu;
     }
-  } else if (layout == code_layout::dibit || layout == code_layout::transpose_half_byte) {
+  } else if (layout == bbq_code_layout::dibit || layout == bbq_code_layout::transpose_half_byte) {
     const size_t stripe_size = (dim + 7) / 8;
     uint32_t code            = 0;
     for (uint32_t bit = 0; bit < bits; ++bit) {
@@ -152,20 +150,21 @@ __device__ __forceinline__ int64_t code_inner_product_unsigned_byte(const uint8_
 
 __device__ __forceinline__ int64_t code_inner_product(const uint8_t* row_a,
                                                       const uint8_t* row_b,
-                                                      const bbq::code_layout layout,
+                                                      const bbq_code_layout layout,
                                                       const uint32_t bits,
                                                       const size_t dim,
                                                       const size_t n_bytes)
 {
   switch (layout) {
-    case code_layout::single_bit: return code_inner_product_binary(row_a, row_b, n_bytes);
-    case code_layout::dibit: return code_inner_product_dibit_symmetric(row_a, row_b, n_bytes);
-    case code_layout::packed_nibble:
+    case bbq_code_layout::single_bit: return code_inner_product_binary(row_a, row_b, n_bytes);
+    case bbq_code_layout::dibit: return code_inner_product_dibit_symmetric(row_a, row_b, n_bytes);
+    case bbq_code_layout::packed_nibble:
       return code_inner_product_int4_packed_nibble_symmetric(row_a, row_b, n_bytes);
-    case code_layout::transpose_half_byte:
+    case bbq_code_layout::transpose_half_byte:
       return code_inner_product_int4_transposeHalfByte_symmetric(row_a, row_b, n_bytes);
-    case code_layout::unsigned_byte: return code_inner_product_unsigned_byte(row_a, row_b, n_bytes);
-    case code_layout::seven_bit:  // unpacked seven_bit: one code per byte
+    case bbq_code_layout::unsigned_byte:
+      return code_inner_product_unsigned_byte(row_a, row_b, n_bytes);
+    case bbq_code_layout::seven_bit:  // unpacked seven_bit: one code per byte
     default:
       int64_t result      = 0;
       const uint32_t mask = (uint32_t{1} << bits) - 1;
@@ -176,18 +175,20 @@ __device__ __forceinline__ int64_t code_inner_product(const uint8_t* row_a,
   }
 }
 /** Integer inner product between two encoded rows. */
+template <typename DataT, typename IdxT, typename Accessor>
 __device__ __forceinline__ int64_t
 code_inner_product(const uint8_t* row_a,
                    const uint8_t* row_b,
-                   const cuvs::neighbors::device_bbq_dataset_storage_view<int64_t>& dataset)
+                   const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset)
 {
   return code_inner_product(
     row_a, row_b, dataset.layout, dataset.bits, dataset.dim(), get_encoded_row_length(dataset));
 }
 
 /** Centered dot product of two rows. */
+template <typename DataT, typename IdxT, typename Accessor>
 __device__ __forceinline__ float centered_dot(
-  const cuvs::neighbors::device_bbq_dataset_storage_view<int64_t>& dataset,
+  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset,
   float code_ip,
   int64_t row_a,
   int64_t row_b)
@@ -205,10 +206,9 @@ __device__ __forceinline__ float centered_dot(
 }
 
 /** Centered dot product. */
+template <typename DataT, typename IdxT, typename Accessor>
 __device__ __forceinline__ float centered_dot(
-  const cuvs::neighbors::device_bbq_dataset_storage_view<int64_t>& dataset,
-  int64_t row_a,
-  int64_t row_b)
+  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset, int64_t row_a, int64_t row_b)
 {
   const uint8_t* codes_a = dataset.codes.data_handle() + row_a * get_encoded_row_length(dataset);
   const uint8_t* codes_b = dataset.codes.data_handle() + row_b * get_encoded_row_length(dataset);
@@ -217,8 +217,9 @@ __device__ __forceinline__ float centered_dot(
 }
 
 // Dot product overload when the centered dot product is already computed
+template <typename DataT, typename IdxT, typename Accessor>
 __device__ __forceinline__ float dot_product(
-  const cuvs::neighbors::device_bbq_dataset_storage_view<int64_t>& dataset,
+  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset,
   float centered_dot_value,
   int64_t row_a,
   int64_t row_b)
@@ -227,17 +228,17 @@ __device__ __forceinline__ float dot_product(
          dataset.additional_corrections(row_b) - dataset.centroid_norm_sq;
 }
 /** Dot product. */
+template <typename DataT, typename IdxT, typename Accessor>
 __device__ __forceinline__ float dot_product(
-  const cuvs::neighbors::device_bbq_dataset_storage_view<int64_t>& dataset,
-  int64_t row_a,
-  int64_t row_b)
+  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset, int64_t row_a, int64_t row_b)
 {
   return dot_product(dataset, centered_dot(dataset, row_a, row_b), row_a, row_b);
 }
 
 /** Squared L2 distance overload when the centered dot product is already computed */
+template <typename DataT, typename IdxT, typename Accessor>
 __device__ __forceinline__ float l2_distance(
-  const cuvs::neighbors::device_bbq_dataset_storage_view<int64_t>& dataset,
+  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset,
   float centered_dot_value,
   int64_t row_a,
   int64_t row_b)
@@ -247,16 +248,16 @@ __device__ __forceinline__ float l2_distance(
   return distance < 0.0f ? 0.0f : distance;
 }
 /** Squared L2 distance. */
+template <typename DataT, typename IdxT, typename Accessor>
 __device__ __forceinline__ float l2_distance(
-  const cuvs::neighbors::device_bbq_dataset_storage_view<int64_t>& dataset,
-  int64_t row_a,
-  int64_t row_b)
+  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset, int64_t row_a, int64_t row_b)
 {
   return l2_distance(dataset, centered_dot(dataset, row_a, row_b), row_a, row_b);
 }
 
+template <typename DataT, typename IdxT, typename Accessor>
 __device__ __forceinline__ float cosine_distance(
-  const cuvs::neighbors::device_bbq_dataset_storage_view<int64_t>& dataset,
+  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset,
   float centered_dot_value,
   int64_t row_a,
   int64_t row_b,
@@ -267,8 +268,9 @@ __device__ __forceinline__ float cosine_distance(
 }
 
 // norm_product = norm_a * norm_b
+template <typename DataT, typename IdxT, typename Accessor>
 __device__ __forceinline__ float cosine_distance(
-  const cuvs::neighbors::device_bbq_dataset_storage_view<int64_t>& dataset,
+  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset,
   int64_t row_a,
   int64_t row_b,
   float norm_product)
@@ -277,11 +279,214 @@ __device__ __forceinline__ float cosine_distance(
 }
 
 /** Squared norm of one original-space row. */
-__device__ __forceinline__ float row_norm(
-  const cuvs::neighbors::device_bbq_dataset_storage_view<int64_t>& dataset, int64_t row)
+template <typename DataT, typename IdxT, typename Accessor>
+__device__ __forceinline__ float row_norm(const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset,
+                                          int64_t row)
 {
   const float norm = dot_product(dataset, row, row);
   return norm < 0.0f ? 0.0f : norm;
+}
+
+template <typename DataT, typename IdxT, typename Accessor>
+struct bbq_row_norm_op {
+  const bbq_quantizer_view<DataT, IdxT, Accessor> quantizer;
+
+  __device__ auto operator()(size_t row) const -> float
+  {
+    return row_norm(quantizer, static_cast<int64_t>(row));
+  }
+};
+
+// Lucene int4BitDotProductImpl
+__device__ __forceinline__ int64_t
+code_inner_product_asymmetric_1_vs_4(const uint8_t* codes_document,
+                                     const uint8_t* codes_query,
+                                     size_t n_bytes,
+                                     const size_t stripe_size)
+{
+  int64_t result = 0;
+  for (int i = 0; i < 4; ++i) {
+    result += code_inner_product_binary(codes_document, codes_query + i * stripe_size, stripe_size)
+              << i;
+  }
+  return result;
+}
+
+// Lucene int4DibitDotProductImpl
+__device__ __forceinline__ int64_t code_inner_product_asymmetric_2_vs_4(
+  const uint8_t* codes_document, const uint8_t* codes_query, size_t n_bytes)
+{
+  int stripe_size = n_bytes / 4;
+  auto ret0 =
+    code_inner_product_asymmetric_1_vs_4(codes_document, codes_query, n_bytes, stripe_size);
+  auto ret1 = code_inner_product_asymmetric_1_vs_4(
+    codes_document + stripe_size, codes_query, n_bytes, stripe_size);
+  return ret0 + (ret1 << 1);
+}
+
+__device__ __forceinline__ int64_t code_inner_product_asymmetric_1_vs_2(
+  const uint8_t* codes_document, const uint8_t* codes_query, size_t n_bytes)
+{
+  int stripe_size = n_bytes / 2;
+  auto res0       = code_inner_product_binary(codes_document, codes_query, stripe_size);
+  auto res1 = code_inner_product_binary(codes_document, codes_query + stripe_size, stripe_size);
+  return res0 + (res1 << 1);
+}
+
+__device__ __forceinline__ int64_t
+code_inner_product_asymmetric(const uint8_t* codes_document,
+                              const uint8_t* codes_query,
+                              const bbq_code_layout layout_dataset,
+                              const bbq_code_layout layout_query,
+                              const size_t n_bytes_query)
+{
+  if (layout_dataset == bbq_code_layout::single_bit &&
+      layout_query == bbq_code_layout::transpose_half_byte) {
+    return code_inner_product_asymmetric_1_vs_4(
+      codes_document, codes_query, n_bytes_query, n_bytes_query / 4);
+  } else if (layout_dataset == bbq_code_layout::single_bit &&
+             layout_query == bbq_code_layout::dibit) {
+    return code_inner_product_asymmetric_1_vs_2(codes_document, codes_query, n_bytes_query);
+  } else if (layout_dataset == bbq_code_layout::dibit &&
+             layout_query == bbq_code_layout::transpose_half_byte) {
+    return code_inner_product_asymmetric_2_vs_4(codes_document, codes_query, n_bytes_query);
+  } else {
+    return -1;  // Unsupported layouts
+  }
+}
+
+/** Centered dot product of two rows. */
+template <typename DataT, typename IdxT, typename Accessor>
+__device__ __forceinline__ float centered_dot(
+  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_document,
+  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_query,
+  float code_ip,
+  int64_t row_document,
+  int64_t row_query)
+{
+  const float lower_doc = dataset_document.lower_intervals(row_document);
+  const float lower_q   = dataset_query.lower_intervals(row_query);
+  const float scale_document =
+    1.0f / static_cast<float>((uint32_t{1} << dataset_document.bits) - 1);
+  const float scale_query = 1.0f / static_cast<float>((uint32_t{1} << dataset_query.bits) - 1);
+  const float delta_doc =
+    (dataset_document.upper_intervals(row_document) - lower_doc) * scale_document;
+  const float delta_q = (dataset_query.upper_intervals(row_query) - lower_q) * scale_query;
+  const float sum_doc = static_cast<float>(dataset_document.quantized_component_sums(row_document));
+  const float sum_q   = static_cast<float>(dataset_query.quantized_component_sums(row_query));
+
+  auto dim = static_cast<float>(dataset_document.dim());
+  return dim * lower_doc * lower_q + lower_q * delta_doc * sum_doc + lower_doc * delta_q * sum_q +
+         delta_doc * delta_q * code_ip;
+}
+
+/** Centered dot product. */
+template <typename DataT, typename IdxT, typename Accessor>
+__device__ __forceinline__ float centered_dot(
+  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_document,
+  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_query,
+  int64_t row_document,
+  int64_t row_query)
+{
+  const uint8_t* codes_doc =
+    dataset_document.codes.data_handle() + row_document * get_encoded_row_length(dataset_document);
+  const uint8_t* codes_q =
+    dataset_query.codes.data_handle() + row_query * get_encoded_row_length(dataset_query);
+  auto n_bytes = get_encoded_row_length(dataset_query);
+  return centered_dot(
+    dataset_document,
+    dataset_query,
+    static_cast<float>(code_inner_product_asymmetric(
+      codes_doc, codes_q, dataset_document.layout, dataset_query.layout, n_bytes)),
+    row_document,
+    row_query);
+}
+
+// Dot product overload when the centered dot product is already computed
+template <typename DataT, typename IdxT, typename Accessor>
+__device__ __forceinline__ float dot_product(
+  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_document,
+  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_query,
+  float centered_dot_value,
+  int64_t row_document,
+  int64_t row_query)
+{
+  return centered_dot_value + dataset_document.additional_corrections(row_document) +
+         dataset_query.additional_corrections(row_query) - dataset_document.centroid_norm_sq;
+}
+/** Dot product. */
+template <typename DataT, typename IdxT, typename Accessor>
+__device__ __forceinline__ float dot_product(
+  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_doc,
+  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_query,
+  int64_t row_document,
+  int64_t row_query)
+{
+  return dot_product(dataset_doc,
+                     dataset_query,
+                     centered_dot(dataset_doc, dataset_query, row_document, row_query),
+                     row_document,
+                     row_query);
+}
+
+/** Squared L2 distance overload when the centered dot product is already computed */
+template <typename DataT, typename IdxT, typename Accessor>
+__device__ __forceinline__ float l2_distance(
+  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_doc,
+  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_query,
+  float centered_dot_value,
+  int64_t row_document,
+  int64_t row_query)
+{
+  const float distance = dataset_doc.additional_corrections(row_document) +
+                         dataset_query.additional_corrections(row_query) -
+                         2.0f * centered_dot_value;
+  return distance < 0.0f ? 0.0f : distance;
+}
+/** Squared L2 distance. */
+template <typename DataT, typename IdxT, typename Accessor>
+__device__ __forceinline__ float l2_distance(
+  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_doc,
+  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_query,
+  int64_t row_document,
+  int64_t row_query)
+{
+  return l2_distance(dataset_doc,
+                     dataset_query,
+                     centered_dot(dataset_doc, dataset_query, row_document, row_query),
+                     row_document,
+                     row_query);
+}
+
+template <typename DataT, typename IdxT, typename Accessor>
+__device__ __forceinline__ float cosine_distance(
+  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_doc,
+  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_query,
+  float centered_dot_value,
+  int64_t row_document,
+  int64_t row_query,
+  float norm_product)
+{
+  const auto dot =
+    dot_product(dataset_doc, dataset_query, centered_dot_value, row_document, row_query);
+  return norm_product > 0.0f ? 1.0f - dot / sqrtf(norm_product) : 0.0f;
+}
+
+// norm_product = norm_a * norm_b
+template <typename DataT, typename IdxT, typename Accessor>
+__device__ __forceinline__ float cosine_distance(
+  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_doc,
+  const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_query,
+  int64_t row_document,
+  int64_t row_query,
+  float norm_product)
+{
+  return cosine_distance(dataset_doc,
+                         dataset_query,
+                         centered_dot(dataset_doc, dataset_query, row_document, row_query),
+                         row_document,
+                         row_query,
+                         norm_product);
 }
 
 #endif  // __CUDACC__
