@@ -28,9 +28,9 @@ _RAFT_HOST_DEVICE constexpr uint32_t get_encoded_row_length(const bbq_code_layou
     case bbq_code_layout::single_bit: return (dim * bits + 7) / 8;
     case bbq_code_layout::dibit: return bits * ((dim + 7) / 8);
     case bbq_code_layout::packed_nibble: return (dim + 1) / 2;
+    case bbq_code_layout::transpose_half_byte: return 4 * ((dim + 7) / 8);
     case bbq_code_layout::seven_bit: return dim;
     case bbq_code_layout::unsigned_byte: return dim;
-    case bbq_code_layout::transpose_half_byte: return 4 * ((dim + 7) / 8);
   }
   return 0;
 }
@@ -75,6 +75,12 @@ __device__ __forceinline__ int64_t code_inner_product_binary(const uint8_t* row_
 {
   int64_t result = 0;
   size_t i       = 0;
+  for (; i + 16 <= n_bytes; i += 16) {
+    uint4 a, b;
+    memcpy(&a, row_a + i, 16);
+    memcpy(&b, row_b + i, 16);
+    result += __popc(a.x & b.x) + __popc(a.y & b.y) + __popc(a.z & b.z) + __popc(a.w & b.w);
+  }
   for (; i + 4 <= n_bytes; i += 4) {
     uint32_t a, b;
     memcpy(&a, row_a + i, 4);
@@ -353,6 +359,30 @@ code_inner_product_asymmetric(const uint8_t* codes_document,
   } else {
     return -1;  // Unsupported layouts
   }
+}
+
+/**
+ * Asymmetric inner product on "n_bytes" of each doc and query plane.
+ */
+__device__ __forceinline__ int64_t
+code_inner_product_asymmetric_tiled(const uint8_t* codes_document,
+                                    const size_t document_plane_stride,
+                                    const uint8_t* codes_query,
+                                    const size_t query_plane_stride,
+                                    const int n_planes_document,
+                                    const int n_planes_query,
+                                    const size_t n_bytes)
+{
+  int64_t result = 0;
+  for (int p_doc = 0; p_doc < n_planes_document; ++p_doc) {
+    for (int p_query = 0; p_query < n_planes_query; ++p_query) {
+      result += code_inner_product_binary(codes_document + p_doc * document_plane_stride,
+                                          codes_query + p_query * query_plane_stride,
+                                          n_bytes)
+                << (p_doc + p_query);
+    }
+  }
+  return result;
 }
 
 /** Centered dot product of two rows. */
