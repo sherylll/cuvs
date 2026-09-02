@@ -42,6 +42,7 @@
 
 #include <mma.h>
 
+#include <cstdlib>
 #include <limits>
 #include <numeric>
 #include <optional>
@@ -971,37 +972,32 @@ template <typename DataT,
           typename Index_t,
           typename ID_t = InternalID_t<Index_t>,
           typename DistEpilogue_t>
-RAFT_KERNEL local_join_kernel_bbq_asymmetric(
-  const Index_t* graph_new,
-  const Index_t* rev_graph_new,
-  const int2* sizes_new,
-  const Index_t* graph_old,
-  const Index_t* rev_graph_old,
-  const int2* sizes_old,
-  const int width,
-  bbq_device_quantizer_view<DataT, int64_t> dataset_query,
-  bbq_device_quantizer_view<DataT, int64_t> dataset_document,
-  ID_t* graph,
-  DistData_t* dists,
-  int graph_width,
-  int* locks,
-  DistData_t* l2_norms_document,
-  DistData_t* l2_norms_query,
-  cuvs::distance::DistanceType metric,
-  DistEpilogue_t dist_epilogue)
+RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
+  local_join_kernel_bbq_asymmetric(const Index_t* graph_new,
+                                   const Index_t* rev_graph_new,
+                                   const int2* sizes_new,
+                                   const Index_t* graph_old,
+                                   const Index_t* rev_graph_old,
+                                   const int2* sizes_old,
+                                   const int width,
+                                   bbq_device_quantizer_view<DataT, int64_t> dataset_query,
+                                   bbq_device_quantizer_view<DataT, int64_t> dataset_document,
+                                   ID_t* graph,
+                                   DistData_t* dists,
+                                   int graph_width,
+                                   int* locks,
+                                   DistData_t* l2_norms_document,
+                                   DistData_t* l2_norms_query,
+                                   cuvs::distance::DistanceType metric,
+                                   DistEpilogue_t dist_epilogue)
 {
-  constexpr int BBQ_ROW_BYTES              = 64;
-  [[maybe_unused]] constexpr int BBQ_PAD   = 4;
-  [[maybe_unused]] constexpr int BBQ_RATIO = 4;
-  constexpr int MAX_NUM_BI_SAMPLES         = 64 * 2;  // tmp
+  constexpr int BBQ_ROW_BYTES = 256;
 
   __shared__ int s_list[MAX_NUM_BI_SAMPLES * 2];
-  //__shared__ uint8_t s_doc_vec[MAX_NUM_BI_SAMPLES][BBQ_ROW_BYTES + BBQ_PAD];
-  //__shared__ uint8_t s_query_vec[MAX_NUM_BI_SAMPLES][(BBQ_ROW_BYTES + BBQ_PAD) * BBQ_RATIO];
-  __shared__ uint8_t s_query_vec[1][2 * sizeof(int)];
+  __shared__ uint8_t s_doc_vec[MAX_NUM_BI_SAMPLES][BBQ_ROW_BYTES];
   __shared__ float s_distances[MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES];
 
-  int* s_unique_counter = reinterpret_cast<int*>(&s_query_vec[0][0]);
+  int* s_unique_counter = reinterpret_cast<int*>(&s_doc_vec[0][0]);
   if (threadIdx.x == 0) {
     s_unique_counter[0] = 0;
     s_unique_counter[1] = 0;
@@ -1037,40 +1033,57 @@ RAFT_KERNEL local_join_kernel_bbq_asymmetric(
   new_size = new_size2.x + s_unique_counter[0];
   old_size = old_size2.x + s_unique_counter[1];
 
-  const int warp_id             = threadIdx.x / raft::warp_size();
-  const int lane_id             = threadIdx.x % raft::warp_size();
-  constexpr int num_warps       = BLOCK_SIZE / raft::warp_size();
-  const uint8_t* codes_query    = dataset_query.codes.data_handle();
-  const uint8_t* codes_document = dataset_document.codes.data_handle();
-  const size_t encoded_row_length_query =
-    cuvs::preprocessing::quantize::bbq::get_encoded_row_length(dataset_query);
-  const size_t encoded_row_length_document =
+  const int warp_id       = threadIdx.x / raft::warp_size();
+  const int lane_id       = threadIdx.x % raft::warp_size();
+  constexpr int num_warps = BLOCK_SIZE / raft::warp_size();
+  const int encoded_row_length_document =
     cuvs::preprocessing::quantize::bbq::get_encoded_row_length(dataset_document);
-  const int n_planes       = dataset_query.bits / dataset_document.bits;
-  const size_t tile_extent = encoded_row_length_query / static_cast<size_t>(n_planes);
+
   // Each plane gets an equal slice of the row in shared memory, so the cached bytes always form a
   // valid encoded chunk.
-  const int plane_tile                     = BBQ_ROW_BYTES / n_planes;
-  [[maybe_unused]] const int tile_ip_bytes = BBQ_ROW_BYTES;
-  const int n_tiles = raft::ceildiv(static_cast<int>(tile_extent), plane_tile);
+  const int plane_extent = raft::ceildiv(static_cast<int>(dataset_document.dim()), 8);
+  const int plane_tile   = BBQ_ROW_BYTES / static_cast<int>(dataset_document.bits);
+  const int n_tiles      = raft::ceildiv(plane_extent, plane_tile);
 
   for (int i = tx; i < MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES; i += blockDim.x) {
     s_distances[i] = 0.0f;
   }
   __syncthreads();
-  for (int i = tx; i < MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES; i += blockDim.x) {
-    const int tmp_row = i / SKEWED_MAX_NUM_BI_SAMPLES;
-    const int tmp_col = i % SKEWED_MAX_NUM_BI_SAMPLES;
-    if (tmp_row < new_size && tmp_col < new_size) {
-      s_distances[i] += cuvs::preprocessing::quantize::bbq::code_inner_product_asymmetric(
-        &dataset_document.codes(new_neighbors[tmp_row], 0),
-        &dataset_query.codes(new_neighbors[tmp_col], 0),
-        dataset_document.layout,
-        dataset_query.layout,
-        encoded_row_length_query);
+  for (int step = 0; step < n_tiles; ++step) {
+    const int num_load = (step == n_tiles - 1) ? plane_extent - step * plane_tile : plane_tile;
+    const size_t base  = static_cast<size_t>(step) * plane_tile;
+#pragma unroll
+    for (int i = 0; i < MAX_NUM_BI_SAMPLES / num_warps; ++i) {
+      const int idx = i * num_warps + warp_id;
+      if (idx < new_size) {
+        for (int p = 0; p < dataset_document.bits; ++p) {
+          load_vec(s_doc_vec[idx] + p * plane_tile,
+                   &dataset_document.codes(new_neighbors[idx],
+                                           base + static_cast<size_t>(p) * plane_extent),
+                   num_load,
+                   plane_tile,
+                   lane_id);
+        }
+      }
     }
+    __syncthreads();
+
+    for (int i = tx; i < MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES; i += blockDim.x) {
+      const int tmp_row = i / SKEWED_MAX_NUM_BI_SAMPLES;
+      const int tmp_col = i % SKEWED_MAX_NUM_BI_SAMPLES;
+      if (tmp_row < new_size && tmp_col < new_size) {
+        s_distances[i] += cuvs::preprocessing::quantize::bbq::code_inner_product_asymmetric_tiled(
+          s_doc_vec[tmp_row],
+          plane_tile,
+          &dataset_query.codes(new_neighbors[tmp_col], static_cast<size_t>(step) * plane_tile),
+          plane_extent,
+          dataset_document.bits,
+          dataset_query.bits,
+          num_load);
+      }
+    }
+    __syncthreads();
   }
-  __syncthreads();
 
   calculate_metric(s_distances,
                    new_neighbors,
@@ -1102,19 +1115,42 @@ RAFT_KERNEL local_join_kernel_bbq_asymmetric(
   }
   __syncthreads();
 
-  for (int i = tx; i < MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES; i += blockDim.x) {
-    const int tmp_row = i / SKEWED_MAX_NUM_BI_SAMPLES;
-    const int tmp_col = i % SKEWED_MAX_NUM_BI_SAMPLES;
-    if (tmp_row < new_size && tmp_col < old_size) {
-      s_distances[i] += cuvs::preprocessing::quantize::bbq::code_inner_product_asymmetric(
-        &dataset_document.codes(new_neighbors[tmp_row], 0),
-        &dataset_query.codes(old_neighbors[tmp_col], 0),
-        dataset_document.layout,
-        dataset_query.layout,
-        encoded_row_length_query);
+  for (int step = 0; step < n_tiles; ++step) {
+    const int num_load = (step == n_tiles - 1) ? plane_extent - step * plane_tile : plane_tile;
+    const size_t base  = static_cast<size_t>(step) * plane_tile;
+    if (n_tiles > 1) {
+#pragma unroll
+      for (int i = 0; i < MAX_NUM_BI_SAMPLES / num_warps; ++i) {
+        const int idx = i * num_warps + warp_id;
+        if (idx < new_size) {
+          for (int p = 0; p < dataset_document.bits; ++p) {
+            load_vec(s_doc_vec[idx] + p * plane_tile,
+                     &dataset_document.codes(new_neighbors[idx],
+                                             base + static_cast<size_t>(p) * plane_extent),
+                     num_load,
+                     plane_tile,
+                     lane_id);
+          }
+        }
+      }
+      __syncthreads();
     }
+    for (int i = tx; i < MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES; i += blockDim.x) {
+      const int tmp_row = i / SKEWED_MAX_NUM_BI_SAMPLES;
+      const int tmp_col = i % SKEWED_MAX_NUM_BI_SAMPLES;
+      if (tmp_row < new_size && tmp_col < old_size) {
+        s_distances[i] += cuvs::preprocessing::quantize::bbq::code_inner_product_asymmetric_tiled(
+          s_doc_vec[tmp_row],
+          plane_tile,
+          &dataset_query.codes(old_neighbors[tmp_col], static_cast<size_t>(step) * plane_tile),
+          plane_extent,
+          dataset_document.bits,
+          dataset_query.bits,
+          num_load);
+      }
+    }
+    __syncthreads();
   }
-  __syncthreads();
 
   calculate_metric(s_distances,
                    new_neighbors,
@@ -1234,11 +1270,11 @@ RAFT_KERNEL local_join_kernel_bbq_symmetric(const Index_t* graph_new,
     Layout == cuvs::preprocessing::quantize::bbq::bbq_code_layout::dibit                 ? 2
     : Layout == cuvs::preprocessing::quantize::bbq::bbq_code_layout::transpose_half_byte ? 4
                                                                                          : 1;
-  const size_t tile_extent = encoded_row_length / static_cast<size_t>(n_planes);
   // Each plane gets an equal slice of the row in shared memory, so the cached bytes always form a
   // valid encoded chunk.
-  const int plane_tile = BBQ_ROW_BYTES / n_planes;
-  const int n_tiles    = raft::ceildiv(static_cast<int>(tile_extent), plane_tile);
+  const size_t plane_extent = encoded_row_length / static_cast<size_t>(n_planes);
+  const int plane_tile      = BBQ_ROW_BYTES / n_planes;
+  const int n_tiles         = raft::ceildiv(static_cast<int>(plane_extent), plane_tile);
 
   for (int i = tx; i < MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES; i += blockDim.x) {
     s_distances_u32[i] = 0;
@@ -1247,16 +1283,15 @@ RAFT_KERNEL local_join_kernel_bbq_symmetric(const Index_t* graph_new,
 
   for (int step = 0; step < n_tiles; ++step) {
     const int num_load =
-      (step == n_tiles - 1) ? static_cast<int>(tile_extent) - step * plane_tile : plane_tile;
+      (step == n_tiles - 1) ? static_cast<int>(plane_extent) - step * plane_tile : plane_tile;
+    const size_t base = static_cast<size_t>(step) * plane_tile;
 #pragma unroll
     for (int i = 0; i < MAX_NUM_BI_SAMPLES / num_warps; ++i) {
       const int idx = i * num_warps + warp_id;
       if (idx < new_size) {
-        const size_t base = static_cast<size_t>(new_neighbors[idx]) * encoded_row_length +
-                            static_cast<size_t>(step) * plane_tile;
         for (int p = 0; p < n_planes; ++p) {
           load_vec(s_nv[idx] + p * plane_tile,
-                   codes + base + static_cast<size_t>(p) * tile_extent,
+                   &dataset.codes(new_neighbors[idx], base + static_cast<size_t>(p) * plane_extent),
                    num_load,
                    plane_tile,
                    lane_id);
@@ -1335,20 +1370,20 @@ RAFT_KERNEL local_join_kernel_bbq_symmetric(const Index_t* graph_new,
 
   for (int step = 0; step < n_tiles; ++step) {
     const int num_load =
-      (step == n_tiles - 1) ? static_cast<int>(tile_extent) - step * plane_tile : plane_tile;
+      (step == n_tiles - 1) ? static_cast<int>(plane_extent) - step * plane_tile : plane_tile;
+    const size_t base = static_cast<size_t>(step) * plane_tile;
     if (n_tiles > 1) {
 #pragma unroll
       for (int i = 0; i < MAX_NUM_BI_SAMPLES / num_warps; ++i) {
         const int idx = i * num_warps + warp_id;
         if (idx < new_size) {
-          const size_t base = static_cast<size_t>(new_neighbors[idx]) * encoded_row_length +
-                              static_cast<size_t>(step) * plane_tile;
           for (int p = 0; p < n_planes; ++p) {
-            load_vec(s_nv[idx] + p * plane_tile,
-                     codes + base + static_cast<size_t>(p) * tile_extent,
-                     num_load,
-                     plane_tile,
-                     lane_id);
+            load_vec(
+              s_nv[idx] + p * plane_tile,
+              &dataset.codes(new_neighbors[idx], base + static_cast<size_t>(p) * plane_extent),
+              num_load,
+              plane_tile,
+              lane_id);
           }
         }
       }
@@ -1357,11 +1392,9 @@ RAFT_KERNEL local_join_kernel_bbq_symmetric(const Index_t* graph_new,
     for (int i = 0; i < MAX_NUM_BI_SAMPLES / num_warps; ++i) {
       const int idx = i * num_warps + warp_id;
       if (idx < old_size) {
-        const size_t base = static_cast<size_t>(old_neighbors[idx]) * encoded_row_length +
-                            static_cast<size_t>(step) * plane_tile;
         for (int p = 0; p < n_planes; ++p) {
           load_vec(s_ov[idx] + p * plane_tile,
-                   codes + base + static_cast<size_t>(p) * tile_extent,
+                   &dataset.codes(old_neighbors[idx], base + static_cast<size_t>(p) * plane_extent),
                    num_load,
                    plane_tile,
                    lane_id);

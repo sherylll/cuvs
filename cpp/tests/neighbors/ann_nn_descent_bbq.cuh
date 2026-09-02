@@ -538,9 +538,9 @@ const std::vector<AnnNNDescentBbqInputs> bbq_inputs = [] {
   std::vector<AnnNNDescentBbqInputs> out;
   for (const auto& [bits, min_recall, layout, second_bits] : bits_specifications) {
     const auto batch = raft::util::itertools::product<AnnNNDescentBbqInputs>(
-      {10000},
-      {64, 256},  // dim
-      {32},       // graph_degree
+      {20000},
+      {256, 1024},  // dim
+      {128},        // graph_degree
       {cuvs::distance::DistanceType::L2Expanded,
        cuvs::distance::DistanceType::L2SqrtExpanded,
        cuvs::distance::DistanceType::InnerProduct,
