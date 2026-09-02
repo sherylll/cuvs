@@ -375,30 +375,6 @@ code_inner_product_asymmetric(const uint8_t* codes_document,
   }
 }
 
-/**
- * Asymmetric inner product on "n_bytes" of each doc and query plane.
- */
-__device__ __forceinline__ int64_t
-code_inner_product_asymmetric_tiled(const uint8_t* codes_document,
-                                    const size_t document_plane_stride,
-                                    const uint8_t* codes_query,
-                                    const size_t query_plane_stride,
-                                    const int n_planes_document,
-                                    const int n_planes_query,
-                                    const size_t n_bytes)
-{
-  int64_t result = 0;
-  for (int p_doc = 0; p_doc < n_planes_document; ++p_doc) {
-    for (int p_query = 0; p_query < n_planes_query; ++p_query) {
-      result += code_inner_product_binary(codes_document + p_doc * document_plane_stride,
-                                          codes_query + p_query * query_plane_stride,
-                                          n_bytes)
-                << (p_doc + p_query);
-    }
-  }
-  return result;
-}
-
 /** Centered dot product of two rows. */
 template <typename DataT, typename IdxT, typename Accessor>
 __device__ __forceinline__ float centered_dot(

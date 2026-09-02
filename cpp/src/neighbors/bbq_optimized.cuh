@@ -36,6 +36,34 @@ __device__ inline void code_inner_product_binary_2x1(const uint8_t* row_a0,
   }
 }
 
+/** Two asymmetric inner products over statically known document and query plane counts. */
+template <int document_bits, int query_bits, size_t document_row_bytes, size_t query_row_bytes>
+__device__ inline void code_inner_product_asymmetric_2x1(const uint8_t* row_a0,
+                                                         const uint8_t* row_a1,
+                                                         const uint8_t* row_b,
+                                                         uint32_t& total0,
+                                                         uint32_t& total1)
+{
+  constexpr size_t document_plane_stride = document_row_bytes / document_bits;
+  constexpr size_t query_plane_stride    = query_row_bytes / query_bits;
+  static_assert(query_plane_stride % sizeof(uint32_t) == 0);
+#pragma unroll
+  for (int p_query = 0; p_query < query_bits; ++p_query) {
+#pragma unroll
+    for (int p_document = 0; p_document < document_bits; ++p_document) {
+      uint32_t partial0 = 0;
+      uint32_t partial1 = 0;
+      code_inner_product_binary_2x1<query_plane_stride>(row_a0 + p_document * document_plane_stride,
+                                                        row_a1 + p_document * document_plane_stride,
+                                                        row_b + p_query * query_plane_stride,
+                                                        partial0,
+                                                        partial1);
+      total0 += partial0 << (p_document + p_query);
+      total1 += partial1 << (p_document + p_query);
+    }
+  }
+}
+
 /** Two two-bit transposed inner products with a shared right operand. */
 template <size_t n_bytes>
 __device__ inline void code_inner_product_dibit_symmetric_2x1(const uint8_t* row_a0,
