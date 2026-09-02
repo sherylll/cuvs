@@ -41,6 +41,8 @@ _RAFT_HOST_DEVICE constexpr uint32_t get_encoded_row_length(
 {
   return get_encoded_row_length(dataset.layout, dataset.bits, dataset.dim());
 }
+
+#if 0  // No callers outside this header.
 __device__ __forceinline__ uint32_t get_code(
   const uint8_t* row, size_t d, const bbq_code_layout layout, const uint32_t bits, const size_t dim)
 {
@@ -68,6 +70,7 @@ __device__ __forceinline__ uint32_t get_code(
     return static_cast<uint32_t>((row[position / 8] >> (7 - position % 8)) & 1u);
   }
 }
+#endif
 
 __device__ __forceinline__ uint32_t code_inner_product_binary(const uint8_t* row_a,
                                                               const uint8_t* row_b,
@@ -268,12 +271,14 @@ __device__ __forceinline__ float l2_distance(
   return distance < 0.0f ? 0.0f : distance;
 }
 /** Squared L2 distance. */
+#if 0  // No callers outside this header.
 template <typename DataT, typename IdxT, typename Accessor>
 __device__ __forceinline__ float l2_distance(
   const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset, int64_t row_a, int64_t row_b)
 {
   return l2_distance(dataset, centered_dot(dataset, row_a, row_b), row_a, row_b);
 }
+#endif
 
 template <typename DataT, typename IdxT, typename Accessor>
 __device__ __forceinline__ float cosine_distance(
@@ -288,6 +293,7 @@ __device__ __forceinline__ float cosine_distance(
 }
 
 // norm_product = norm_a * norm_b
+#if 0  // No callers outside this header.
 template <typename DataT, typename IdxT, typename Accessor>
 __device__ __forceinline__ float cosine_distance(
   const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset,
@@ -297,6 +303,7 @@ __device__ __forceinline__ float cosine_distance(
 {
   return cosine_distance(dataset, centered_dot(dataset, row_a, row_b), row_a, row_b, norm_product);
 }
+#endif
 
 /** Squared norm of one original-space row. */
 template <typename DataT, typename IdxT, typename Accessor>
@@ -317,6 +324,7 @@ struct bbq_row_norm_op {
   }
 };
 
+#if 0  // No callers outside this header.
 // Lucene int4BitDotProductImpl
 __device__ __forceinline__ int64_t
 code_inner_product_asymmetric_1_vs_4(const uint8_t* codes_document,
@@ -374,6 +382,7 @@ code_inner_product_asymmetric(const uint8_t* codes_document,
     return -1;  // Unsupported layouts
   }
 }
+#endif
 
 /** Centered dot product of two rows. */
 template <typename DataT, typename IdxT, typename Accessor>
@@ -401,6 +410,7 @@ __device__ __forceinline__ float centered_dot(
 }
 
 /** Centered dot product. */
+#if 0  // No callers outside this header.
 template <typename DataT, typename IdxT, typename Accessor>
 __device__ __forceinline__ float centered_dot(
   const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_document,
@@ -421,6 +431,7 @@ __device__ __forceinline__ float centered_dot(
     row_document,
     row_query);
 }
+#endif
 
 // Dot product overload when the centered dot product is already computed
 template <typename DataT, typename IdxT, typename Accessor>
@@ -435,6 +446,7 @@ __device__ __forceinline__ float dot_product(
          dataset_query.additional_corrections(row_query) - dataset_document.centroid_norm_sq;
 }
 /** Dot product. */
+#if 0  // No callers outside this header.
 template <typename DataT, typename IdxT, typename Accessor>
 __device__ __forceinline__ float dot_product(
   const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_doc,
@@ -448,6 +460,7 @@ __device__ __forceinline__ float dot_product(
                      row_document,
                      row_query);
 }
+#endif
 
 /** Squared L2 distance overload when the centered dot product is already computed */
 template <typename DataT, typename IdxT, typename Accessor>
@@ -464,6 +477,7 @@ __device__ __forceinline__ float l2_distance(
   return distance < 0.0f ? 0.0f : distance;
 }
 /** Squared L2 distance. */
+#if 0  // No callers outside this header.
 template <typename DataT, typename IdxT, typename Accessor>
 __device__ __forceinline__ float l2_distance(
   const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_doc,
@@ -477,6 +491,7 @@ __device__ __forceinline__ float l2_distance(
                      row_document,
                      row_query);
 }
+#endif
 
 template <typename DataT, typename IdxT, typename Accessor>
 __device__ __forceinline__ float cosine_distance(
@@ -493,6 +508,7 @@ __device__ __forceinline__ float cosine_distance(
 }
 
 // norm_product = norm_a * norm_b
+#if 0  // No callers outside this header.
 template <typename DataT, typename IdxT, typename Accessor>
 __device__ __forceinline__ float cosine_distance(
   const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset_doc,
@@ -508,6 +524,7 @@ __device__ __forceinline__ float cosine_distance(
                          row_query,
                          norm_product);
 }
+#endif
 
 #endif  // __CUDACC__
 
