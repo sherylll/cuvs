@@ -69,11 +69,11 @@ __device__ __forceinline__ uint32_t get_code(
   }
 }
 
-__device__ __forceinline__ int64_t code_inner_product_binary(const uint8_t* row_a,
-                                                             const uint8_t* row_b,
-                                                             size_t n_bytes)
+__device__ __forceinline__ uint32_t code_inner_product_binary(const uint8_t* row_a,
+                                                              const uint8_t* row_b,
+                                                              size_t n_bytes,
+                                                              uint32_t result = 0)
 {
-  int64_t result = 0;
   size_t i       = 0;
   for (; i + 4 <= n_bytes; i += 4) {
     uint32_t a, b;
@@ -87,24 +87,23 @@ __device__ __forceinline__ int64_t code_inner_product_binary(const uint8_t* row_
   return result;
 }
 
-__device__ __forceinline__ int64_t code_inner_product_dibit_symmetric(const uint8_t* a,
-                                                                      const uint8_t* b,
-                                                                      size_t n_bytes)
+__device__ __forceinline__ uint32_t code_inner_product_dibit_symmetric(const uint8_t* a,
+                                                                       const uint8_t* b,
+                                                                       size_t n_bytes,
+                                                                       uint32_t result = 0)
 {
   const size_t stripe_size = n_bytes / 2;
-  int64_t r                = 0;
   for (int i = 0; i < 2; ++i)
     for (int j = 0; j < 2; ++j)
-      r += code_inner_product_binary(a + i * stripe_size, b + j * stripe_size, stripe_size)
-           << (i + j);
-  return r;
+      result += code_inner_product_binary(a + i * stripe_size, b + j * stripe_size, stripe_size)
+                << (i + j);
+  return result;
 }
 
-__device__ __forceinline__ int64_t code_inner_product_int4_transposeHalfByte_symmetric(
-  const uint8_t* row_a, const uint8_t* row_b, size_t n_bytes)
+__device__ __forceinline__ uint32_t code_inner_product_int4_transposeHalfByte_symmetric(
+  const uint8_t* row_a, const uint8_t* row_b, size_t n_bytes, uint32_t result = 0)
 {
   const size_t stripe_size = n_bytes / 4;
-  int64_t result           = 0;
   for (int i = 0; i < 4; ++i) {
     for (int j = 0; j < 4; ++j) {
       result +=
@@ -116,11 +115,19 @@ __device__ __forceinline__ int64_t code_inner_product_int4_transposeHalfByte_sym
 }
 
 /** Symmetric for packNibbles (Lucene int4DotProductBothPacked). */
-__device__ __forceinline__ int64_t code_inner_product_int4_packed_nibble_symmetric(
-  const uint8_t* row_a, const uint8_t* row_b, size_t n_bytes)
+__device__ __forceinline__ uint32_t code_inner_product_int4_packed_nibble_symmetric(
+  const uint8_t* row_a, const uint8_t* row_b, size_t n_bytes, uint32_t total = 0)
 {
-  int64_t total = 0;
-  for (size_t i = 0; i < n_bytes; ++i) {
+  constexpr uint32_t nibble_mask = 0x0F0F0F0Fu;
+  size_t i                       = 0;
+#pragma unroll 4
+  for (; i + 4 <= n_bytes; i += 4) {
+    const auto a = *reinterpret_cast<const uint32_t*>(row_a + i);
+    const auto b = *reinterpret_cast<const uint32_t*>(row_b + i);
+    total        = __dp4a(a & nibble_mask, b & nibble_mask, total);
+    total        = __dp4a((a >> 4) & nibble_mask, (b >> 4) & nibble_mask, total);
+  }
+  for (; i < n_bytes; ++i) {
     const unsigned a = row_a[i];
     const unsigned b = row_b[i];
     total += (a & 0x0Fu) * (b & 0x0Fu);
@@ -129,60 +136,67 @@ __device__ __forceinline__ int64_t code_inner_product_int4_packed_nibble_symmetr
   return total;
 }
 
-/** Unsigned byte dot product vectorized. */
-__device__ __forceinline__ int64_t code_inner_product_unsigned_byte(const uint8_t* row_a,
-                                                                    const uint8_t* row_b,
-                                                                    size_t n_bytes)
+/** One-byte-per-code dot product, optionally masking unused high bits. */
+__device__ __forceinline__ uint32_t code_inner_product_unsigned_byte(const uint8_t* row_a,
+                                                                     const uint8_t* row_b,
+                                                                     size_t n_bytes,
+                                                                     uint32_t result   = 0,
+                                                                     uint8_t code_mask = 0xFFu)
 {
-  int64_t result = 0;
+  const uint32_t word_mask = uint32_t{code_mask} * 0x01010101u;
   size_t i       = 0;
+#pragma unroll 4
   for (; i + 4 <= n_bytes; i += 4) {
-    uint32_t a, b;
-    memcpy(&a, row_a + i, sizeof(uint32_t));
-    memcpy(&b, row_b + i, sizeof(uint32_t));
-    result += __dp4a(a, b, 0u);
+    const auto a = *reinterpret_cast<const uint32_t*>(row_a + i) & word_mask;
+    const auto b = *reinterpret_cast<const uint32_t*>(row_b + i) & word_mask;
+    result       = __dp4a(a, b, result);
   }
   for (; i < n_bytes; ++i) {
-    result += static_cast<int64_t>(row_a[i]) * static_cast<int64_t>(row_b[i]);
+    result +=
+      static_cast<uint32_t>(row_a[i] & code_mask) * static_cast<uint32_t>(row_b[i] & code_mask);
   }
   return result;
 }
 
-__device__ __forceinline__ int64_t code_inner_product(const uint8_t* row_a,
-                                                      const uint8_t* row_b,
-                                                      const bbq_code_layout layout,
-                                                      const uint32_t bits,
-                                                      const size_t dim,
-                                                      const size_t n_bytes)
+/**
+ * Integer inner product between two encoded rows.
+ *
+ * The uint32_t result bounds every BBQ layout to 66,050 dimensions: the worst case is
+ * `unsigned_byte`, where `dim * 255 * 255` must not exceed UINT32_MAX.
+ */
+__device__ __forceinline__ uint32_t code_inner_product(const uint8_t* row_a,
+                                                       const uint8_t* row_b,
+                                                       const bbq_code_layout layout,
+                                                       const uint32_t bits,
+                                                       const size_t n_bytes,
+                                                       uint32_t result = 0)
 {
   switch (layout) {
-    case bbq_code_layout::single_bit: return code_inner_product_binary(row_a, row_b, n_bytes);
-    case bbq_code_layout::dibit: return code_inner_product_dibit_symmetric(row_a, row_b, n_bytes);
+    case bbq_code_layout::single_bit:
+      return code_inner_product_binary(row_a, row_b, n_bytes, result);
+    case bbq_code_layout::dibit:
+      return code_inner_product_dibit_symmetric(row_a, row_b, n_bytes, result);
     case bbq_code_layout::packed_nibble:
-      return code_inner_product_int4_packed_nibble_symmetric(row_a, row_b, n_bytes);
+      return code_inner_product_int4_packed_nibble_symmetric(row_a, row_b, n_bytes, result);
     case bbq_code_layout::transpose_half_byte:
-      return code_inner_product_int4_transposeHalfByte_symmetric(row_a, row_b, n_bytes);
+      return code_inner_product_int4_transposeHalfByte_symmetric(row_a, row_b, n_bytes, result);
     case bbq_code_layout::unsigned_byte:
-      return code_inner_product_unsigned_byte(row_a, row_b, n_bytes);
-    case bbq_code_layout::seven_bit:  // unpacked seven_bit: one code per byte
+      return code_inner_product_unsigned_byte(row_a, row_b, n_bytes, result);
+    case bbq_code_layout::seven_bit:
     default:
-      int64_t result      = 0;
-      const uint32_t mask = (uint32_t{1} << bits) - 1;
-      for (size_t d = 0; d < n_bytes; ++d) {
-        result += static_cast<int64_t>(row_a[d] & mask) * static_cast<int64_t>(row_b[d] & mask);
-      }
-      return result;
+      return code_inner_product_unsigned_byte(
+        row_a, row_b, n_bytes, result, static_cast<uint8_t>((uint32_t{1} << bits) - 1));
   }
 }
-/** Integer inner product between two encoded rows. */
+
 template <typename DataT, typename IdxT, typename Accessor>
-__device__ __forceinline__ int64_t
+__device__ __forceinline__ uint32_t
 code_inner_product(const uint8_t* row_a,
                    const uint8_t* row_b,
                    const bbq_quantizer_view<DataT, IdxT, Accessor>& dataset)
 {
   return code_inner_product(
-    row_a, row_b, dataset.layout, dataset.bits, dataset.dim(), get_encoded_row_length(dataset));
+    row_a, row_b, dataset.layout, dataset.bits, get_encoded_row_length(dataset));
 }
 
 /** Centered dot product of two rows. */

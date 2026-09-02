@@ -12,6 +12,7 @@
 #include "../../core/nvtx.hpp"
 #include "../../core/omp_wrapper.hpp"
 #include "../bbq.cuh"
+#include "../bbq_optimized.cuh"
 #include <cuvs/distance/distance.hpp>
 #include <cuvs/neighbors/nn_descent.hpp>
 #include <cuvs/preprocessing/quantize/bbq.hpp>
@@ -635,6 +636,53 @@ __device__ __forceinline__ void calculate_metric(
   }
 }
 
+template <typename DataT, typename Index_t, typename DistEpilogue_t>
+__device__ __forceinline__ void calculate_metric_bbq_symmetric(
+  float* s_distances,
+  uint32_t* s_distances_u32,
+  Index_t* row_neighbors,
+  int list_row_size,
+  Index_t* col_neighbors,
+  int list_col_size,
+  const bbq_device_quantizer_view<DataT, int64_t> quantizer,
+  DistData_t* l2_norms,
+  cuvs::distance::DistanceType metric,
+  DistEpilogue_t dist_epilogue)
+{
+  const bool can_postprocess_dist = std::is_same_v<DistEpilogue_t, raft::identity_op>;
+
+  for (int i = threadIdx.x; i < MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES; i += blockDim.x) {
+    const int row_id = i / SKEWED_MAX_NUM_BI_SAMPLES;
+    const int col_id = i % SKEWED_MAX_NUM_BI_SAMPLES;
+
+    if (row_id < list_row_size && col_id < list_col_size) {
+      const Index_t row    = row_neighbors[row_id];
+      const Index_t col    = col_neighbors[col_id];
+      const float centered = cuvs::preprocessing::quantize::bbq::centered_dot(
+        quantizer, static_cast<float>(s_distances_u32[i]), row, col);
+
+      if (metric == cuvs::distance::DistanceType::L2Expanded ||
+          metric == cuvs::distance::DistanceType::L2SqrtExpanded) {
+        s_distances[i] =
+          cuvs::preprocessing::quantize::bbq::l2_distance(quantizer, centered, row, col);
+        if (!can_postprocess_dist && metric == cuvs::distance::DistanceType::L2SqrtExpanded) {
+          s_distances[i] = sqrtf(s_distances[i]);
+        }
+      } else if (metric == cuvs::distance::DistanceType::InnerProduct) {
+        s_distances[i] =
+          -cuvs::preprocessing::quantize::bbq::dot_product(quantizer, centered, row, col);
+      } else if (metric == cuvs::distance::DistanceType::CosineExpanded) {
+        const float norm_product = l2_norms[row] * l2_norms[col];
+        s_distances[i]           = cuvs::preprocessing::quantize::bbq::cosine_distance(
+          quantizer, centered, row, col, norm_product);
+      }
+      s_distances[i] = dist_epilogue(s_distances[i], row, col);
+    } else {
+      s_distances[i] = std::numeric_limits<float>::max();
+    }
+  }
+}
+
 struct DistAccumulator {
   cuvs::distance::DistanceType metric;
   __device__ __forceinline__ float operator()(float a, float b) const
@@ -1105,7 +1153,8 @@ RAFT_KERNEL local_join_kernel_bbq_asymmetric(
   }
 }
 
-template <typename DataT,
+template <cuvs::preprocessing::quantize::bbq::bbq_code_layout Layout,
+          typename DataT,
           typename Index_t,
           typename ID_t = InternalID_t<Index_t>,
           typename DistEpilogue_t>
@@ -1125,15 +1174,18 @@ RAFT_KERNEL local_join_kernel_bbq_symmetric(const Index_t* graph_new,
                                             cuvs::distance::DistanceType metric,
                                             DistEpilogue_t dist_epilogue)
 {
-  constexpr int BBQ_ROW_BYTES = 128;
+  constexpr int BBQ_ROW_BYTES = 64;
   constexpr int BBQ_PAD       = 4;
+  static_assert((BBQ_ROW_BYTES + BBQ_PAD) % alignof(uint32_t) == 0);
 
   __shared__ int s_list[MAX_NUM_BI_SAMPLES * 2];
-  __shared__ uint8_t s_nv[MAX_NUM_BI_SAMPLES][BBQ_ROW_BYTES + BBQ_PAD];
-  __shared__ uint8_t s_ov[MAX_NUM_BI_SAMPLES][BBQ_ROW_BYTES + BBQ_PAD];
-  __shared__ float s_distances[MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES];
+  __shared__ __align__(alignof(uint32_t)) uint8_t s_nv[MAX_NUM_BI_SAMPLES][BBQ_ROW_BYTES + BBQ_PAD];
+  __shared__ __align__(alignof(uint32_t)) uint8_t s_ov[MAX_NUM_BI_SAMPLES][BBQ_ROW_BYTES + BBQ_PAD];
+  __shared__ uint32_t s_distances_u32[MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES];
+  __shared__ int s_unique_counter[2];
+  // Raw code inner products are uint32_t until metric conversion overwrites each entry as float.
+  float* s_distances = reinterpret_cast<float*>(s_distances_u32);
 
-  int* s_unique_counter = reinterpret_cast<int*>(&s_ov[0][0]);
   if (threadIdx.x == 0) {
     s_unique_counter[0] = 0;
     s_unique_counter[1] = 0;
@@ -1169,30 +1221,29 @@ RAFT_KERNEL local_join_kernel_bbq_symmetric(const Index_t* graph_new,
   new_size = new_size2.x + s_unique_counter[0];
   old_size = old_size2.x + s_unique_counter[1];
 
+  // Used only to avoid a scalar tail 2x1 computations.
+  const int new_size_padded = raft::ceildiv(new_size, 2) * 2;
+
   const int warp_id       = threadIdx.x / raft::warp_size();
   const int lane_id       = threadIdx.x % raft::warp_size();
   constexpr int num_warps = BLOCK_SIZE / raft::warp_size();
   const uint8_t* codes    = dataset.codes.data_handle();
   const size_t encoded_row_length =
     cuvs::preprocessing::quantize::bbq::get_encoded_row_length(dataset);
-  const int n_planes = [](cuvs::preprocessing::quantize::bbq::bbq_code_layout layout) {
-    if (layout == cuvs::preprocessing::quantize::bbq::bbq_code_layout::dibit) { return 2; }
-    if (layout == cuvs::preprocessing::quantize::bbq::bbq_code_layout::transpose_half_byte) {
-      return 4;
-    }
-    return 1;
-  }(dataset.layout);
+  constexpr int n_planes =
+    Layout == cuvs::preprocessing::quantize::bbq::bbq_code_layout::dibit                 ? 2
+    : Layout == cuvs::preprocessing::quantize::bbq::bbq_code_layout::transpose_half_byte ? 4
+                                                                                         : 1;
   const size_t tile_extent = encoded_row_length / static_cast<size_t>(n_planes);
   // Each plane gets an equal slice of the row in shared memory, so the cached bytes always form a
   // valid encoded chunk.
-  const int plane_tile    = BBQ_ROW_BYTES / n_planes;
-  const int tile_ip_bytes = BBQ_ROW_BYTES;
-  const int n_tiles       = raft::ceildiv(static_cast<int>(tile_extent), plane_tile);
+  const int plane_tile = BBQ_ROW_BYTES / n_planes;
+  const int n_tiles    = raft::ceildiv(static_cast<int>(tile_extent), plane_tile);
 
   for (int i = tx; i < MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES; i += blockDim.x) {
-    s_distances[i] = 0.0f;
+    s_distances_u32[i] = 0;
   }
-  __syncthreads();
+  // there is sync inside the loop, so no need to sync here
 
   for (int step = 0; step < n_tiles; ++step) {
     const int num_load =
@@ -1214,29 +1265,55 @@ RAFT_KERNEL local_join_kernel_bbq_symmetric(const Index_t* graph_new,
     }
     __syncthreads();
 
-    for (int i = tx; i < MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES; i += blockDim.x) {
-      const int tmp_row = i / SKEWED_MAX_NUM_BI_SAMPLES;
-      const int tmp_col = i % SKEWED_MAX_NUM_BI_SAMPLES;
-      if (tmp_row < new_size && tmp_col < new_size) {
-        s_distances[i] += cuvs::preprocessing::quantize::bbq::code_inner_product(
-          s_nv[tmp_row], s_nv[tmp_col], dataset.layout, dataset.bits, dataset.dim(), tile_ip_bytes);
+    constexpr int num_row_pairs = MAX_NUM_BI_SAMPLES / 2;
+    for (int pair_idx = tx; pair_idx < num_row_pairs * MAX_NUM_BI_SAMPLES; pair_idx += blockDim.x) {
+      const int row0 = (pair_idx / MAX_NUM_BI_SAMPLES) * 2;
+      const int col  = pair_idx % MAX_NUM_BI_SAMPLES;
+      if (row0 < new_size_padded && col < new_size) {
+        const int distance0 = row0 * SKEWED_MAX_NUM_BI_SAMPLES + col;
+        uint32_t total0     = s_distances_u32[distance0];
+        uint32_t total1     = s_distances_u32[distance0 + SKEWED_MAX_NUM_BI_SAMPLES];
+        if constexpr (Layout == cuvs::preprocessing::quantize::bbq::bbq_code_layout::single_bit) {
+          cuvs::preprocessing::quantize::bbq::code_inner_product_binary_2x1<BBQ_ROW_BYTES>(
+            s_nv[row0], s_nv[row0 + 1], s_nv[col], total0, total1);
+        } else if constexpr (Layout == cuvs::preprocessing::quantize::bbq::bbq_code_layout::dibit) {
+          cuvs::preprocessing::quantize::bbq::code_inner_product_dibit_symmetric_2x1<BBQ_ROW_BYTES>(
+            s_nv[row0], s_nv[row0 + 1], s_nv[col], total0, total1);
+        } else if constexpr (Layout ==
+                             cuvs::preprocessing::quantize::bbq::bbq_code_layout::packed_nibble) {
+          cuvs::preprocessing::quantize::bbq::code_inner_product_int4_packed_nibble_symmetric_2x1<
+            BBQ_ROW_BYTES>(s_nv[row0], s_nv[row0 + 1], s_nv[col], total0, total1);
+        } else if constexpr (Layout == cuvs::preprocessing::quantize::bbq::bbq_code_layout::
+                                         transpose_half_byte) {
+          cuvs::preprocessing::quantize::bbq::
+            code_inner_product_int4_transposeHalfByte_symmetric_2x1<BBQ_ROW_BYTES>(
+              s_nv[row0], s_nv[row0 + 1], s_nv[col], total0, total1);
+        } else {
+          cuvs::preprocessing::quantize::bbq::code_inner_product_unsigned_byte_2x1<BBQ_ROW_BYTES>(
+            s_nv[row0],
+            s_nv[row0 + 1],
+            s_nv[col],
+            total0,
+            total1,
+            static_cast<uint8_t>((uint32_t{1} << dataset.bits) - 1));
+        }
+        s_distances_u32[distance0]                             = total0;
+        s_distances_u32[distance0 + SKEWED_MAX_NUM_BI_SAMPLES] = total1;
       }
     }
     __syncthreads();
   }
-  __syncthreads();
 
-  calculate_metric(s_distances,
-                   new_neighbors,
-                   new_size,
-                   new_neighbors,
-                   new_size,
-                   dataset,
-                   std::optional<bbq_device_quantizer_view<DataT, int64_t>>{},
-                   l2_norms,
-                   nullptr,
-                   metric,
-                   dist_epilogue);
+  calculate_metric_bbq_symmetric(s_distances,
+                                 s_distances_u32,
+                                 new_neighbors,
+                                 new_size,
+                                 new_neighbors,
+                                 new_size,
+                                 dataset,
+                                 l2_norms,
+                                 metric,
+                                 dist_epilogue);
   __syncthreads();
 
   for (int step = 0; step < raft::ceildiv(new_size, num_warps); ++step) {
@@ -1252,9 +1329,9 @@ RAFT_KERNEL local_join_kernel_bbq_symmetric(const Index_t* graph_new,
   __syncthreads();
 
   for (int i = tx; i < MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES; i += blockDim.x) {
-    s_distances[i] = 0.0f;
+    s_distances_u32[i] = 0;
   }
-  __syncthreads();
+  // there is sync inside the loop, so no need to sync here
 
   for (int step = 0; step < n_tiles; ++step) {
     const int num_load =
@@ -1293,29 +1370,55 @@ RAFT_KERNEL local_join_kernel_bbq_symmetric(const Index_t* graph_new,
     }
     __syncthreads();
 
-    for (int i = tx; i < MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES; i += blockDim.x) {
-      const int tmp_row = i / SKEWED_MAX_NUM_BI_SAMPLES;
-      const int tmp_col = i % SKEWED_MAX_NUM_BI_SAMPLES;
-      if (tmp_row < new_size && tmp_col < old_size) {
-        s_distances[i] += cuvs::preprocessing::quantize::bbq::code_inner_product(
-          s_nv[tmp_row], s_ov[tmp_col], dataset.layout, dataset.bits, dataset.dim(), tile_ip_bytes);
+    constexpr int num_row_pairs = MAX_NUM_BI_SAMPLES / 2;
+    for (int pair_idx = tx; pair_idx < num_row_pairs * MAX_NUM_BI_SAMPLES; pair_idx += blockDim.x) {
+      const int row0 = (pair_idx / MAX_NUM_BI_SAMPLES) * 2;
+      const int col  = pair_idx % MAX_NUM_BI_SAMPLES;
+      if (row0 < new_size_padded && col < old_size) {
+        const int distance0 = row0 * SKEWED_MAX_NUM_BI_SAMPLES + col;
+        uint32_t total0     = s_distances_u32[distance0];
+        uint32_t total1     = s_distances_u32[distance0 + SKEWED_MAX_NUM_BI_SAMPLES];
+        if constexpr (Layout == cuvs::preprocessing::quantize::bbq::bbq_code_layout::single_bit) {
+          cuvs::preprocessing::quantize::bbq::code_inner_product_binary_2x1<BBQ_ROW_BYTES>(
+            s_nv[row0], s_nv[row0 + 1], s_ov[col], total0, total1);
+        } else if constexpr (Layout == cuvs::preprocessing::quantize::bbq::bbq_code_layout::dibit) {
+          cuvs::preprocessing::quantize::bbq::code_inner_product_dibit_symmetric_2x1<BBQ_ROW_BYTES>(
+            s_nv[row0], s_nv[row0 + 1], s_ov[col], total0, total1);
+        } else if constexpr (Layout ==
+                             cuvs::preprocessing::quantize::bbq::bbq_code_layout::packed_nibble) {
+          cuvs::preprocessing::quantize::bbq::code_inner_product_int4_packed_nibble_symmetric_2x1<
+            BBQ_ROW_BYTES>(s_nv[row0], s_nv[row0 + 1], s_ov[col], total0, total1);
+        } else if constexpr (Layout == cuvs::preprocessing::quantize::bbq::bbq_code_layout::
+                                         transpose_half_byte) {
+          cuvs::preprocessing::quantize::bbq::
+            code_inner_product_int4_transposeHalfByte_symmetric_2x1<BBQ_ROW_BYTES>(
+              s_nv[row0], s_nv[row0 + 1], s_ov[col], total0, total1);
+        } else {
+          cuvs::preprocessing::quantize::bbq::code_inner_product_unsigned_byte_2x1<BBQ_ROW_BYTES>(
+            s_nv[row0],
+            s_nv[row0 + 1],
+            s_ov[col],
+            total0,
+            total1,
+            static_cast<uint8_t>((uint32_t{1} << dataset.bits) - 1));
+        }
+        s_distances_u32[distance0]                             = total0;
+        s_distances_u32[distance0 + SKEWED_MAX_NUM_BI_SAMPLES] = total1;
       }
     }
     __syncthreads();
   }
-  __syncthreads();
 
-  calculate_metric(s_distances,
-                   new_neighbors,
-                   new_size,
-                   old_neighbors,
-                   old_size,
-                   dataset,
-                   std::optional<bbq_device_quantizer_view<DataT, int64_t>>{},
-                   l2_norms,
-                   nullptr,
-                   metric,
-                   dist_epilogue);
+  calculate_metric_bbq_symmetric(s_distances,
+                                 s_distances_u32,
+                                 new_neighbors,
+                                 new_size,
+                                 old_neighbors,
+                                 old_size,
+                                 dataset,
+                                 l2_norms,
+                                 metric,
+                                 dist_epilogue);
   __syncthreads();
 
   for (int step = 0; step < raft::ceildiv(MAX_NUM_BI_SAMPLES * 2, num_warps); ++step) {
@@ -2051,22 +2154,52 @@ void GNND<Data_t, Index_t>::local_join(cudaStream_t stream,
     if (build_config_.metric == cuvs::distance::DistanceType::CosineExpanded) {
       raft::linalg::map_offset(res, l2_norms_.view(), bbq::bbq_row_norm_op{quantizer});
     }
-    local_join_kernel_bbq_symmetric<<<nrow_, BLOCK_SIZE, 0, stream>>>(
-      graph_.h_graph_new.data_handle(),
-      h_rev_graph_new_.data_handle(),
-      d_list_sizes_new_.data_handle(),
-      h_graph_old_.data_handle(),
-      h_rev_graph_old_.data_handle(),
-      d_list_sizes_old_.data_handle(),
-      NUM_SAMPLES,
-      quantizer,
-      graph_buffer_.data_handle(),
-      dists_buffer_.data_handle(),
-      DEGREE_ON_DEVICE,
-      d_locks_.data_handle(),
-      l2_norms_.data_handle(),
-      build_config_.metric,
-      dist_epilogue);
+    auto launch_symmetric = [&](auto layout) {
+      constexpr auto Layout = decltype(layout)::value;
+      local_join_kernel_bbq_symmetric<Layout>
+        <<<nrow_, BLOCK_SIZE, 0, stream>>>(graph_.h_graph_new.data_handle(),
+                                           h_rev_graph_new_.data_handle(),
+                                           d_list_sizes_new_.data_handle(),
+                                           h_graph_old_.data_handle(),
+                                           h_rev_graph_old_.data_handle(),
+                                           d_list_sizes_old_.data_handle(),
+                                           NUM_SAMPLES,
+                                           quantizer,
+                                           graph_buffer_.data_handle(),
+                                           dists_buffer_.data_handle(),
+                                           DEGREE_ON_DEVICE,
+                                           d_locks_.data_handle(),
+                                           l2_norms_.data_handle(),
+                                           build_config_.metric,
+                                           dist_epilogue);
+    };
+    switch (quantizer.layout) {
+      case bbq::bbq_code_layout::single_bit:
+        launch_symmetric(
+          std::integral_constant<bbq::bbq_code_layout, bbq::bbq_code_layout::single_bit>{});
+        break;
+      case bbq::bbq_code_layout::dibit:
+        launch_symmetric(
+          std::integral_constant<bbq::bbq_code_layout, bbq::bbq_code_layout::dibit>{});
+        break;
+      case bbq::bbq_code_layout::packed_nibble:
+        launch_symmetric(
+          std::integral_constant<bbq::bbq_code_layout, bbq::bbq_code_layout::packed_nibble>{});
+        break;
+      case bbq::bbq_code_layout::transpose_half_byte:
+        launch_symmetric(std::integral_constant<bbq::bbq_code_layout,
+                                                bbq::bbq_code_layout::transpose_half_byte>{});
+        break;
+      case bbq::bbq_code_layout::seven_bit:
+        launch_symmetric(
+          std::integral_constant<bbq::bbq_code_layout, bbq::bbq_code_layout::seven_bit>{});
+        break;
+      case bbq::bbq_code_layout::unsigned_byte:
+        launch_symmetric(
+          std::integral_constant<bbq::bbq_code_layout, bbq::bbq_code_layout::unsigned_byte>{});
+        break;
+      default: RAFT_FAIL("Unsupported BBQ layout for symmetric local join.");
+    }
   }
   RAFT_CUDA_TRY(cudaPeekAtLastError());
 }
