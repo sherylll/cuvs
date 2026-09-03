@@ -242,3 +242,8 @@ SM Active Cycles              cycle   6015591.25
 Compute (SM) Throughput           %        77.49
 ----------------------- ----------- ------------
 ```
+
+
+## Other problems
+- With a row distance being 4B x 256, unrolling by 2 always cause conflict (current 64+4 skew is specific to mma, we might move all bbq kernels to mma too)
+- L2 norm is in global memory and accessed randomly (same for WMMA kernel)
