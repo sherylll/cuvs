@@ -28,6 +28,7 @@ _RAFT_HOST_DEVICE constexpr uint32_t get_encoded_row_length(const bbq_code_layou
     case bbq_code_layout::single_bit: return (dim * bits + 7) / 8;
     case bbq_code_layout::dibit: return bits * ((dim + 7) / 8);
     case bbq_code_layout::packed_nibble: return (dim + 1) / 2;
+    case bbq_code_layout::packed_dibit: return (dim + 3) / 4;
     case bbq_code_layout::transpose_half_byte: return 4 * ((dim + 7) / 8);
     case bbq_code_layout::seven_bit: return dim;
     case bbq_code_layout::unsigned_byte: return dim;

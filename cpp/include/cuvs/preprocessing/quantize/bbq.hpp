@@ -46,6 +46,12 @@ enum class bbq_code_layout {
                         * fourth set of dimensions bits, respectively. Format used for queries. */
   packed_nibble, /** Each dimension is quantized to 4 bits, two values are packed into each output
                   * byte. Reflects OffHeapScalarQuantizedVectorValues.packNibbles. */
+  packed_dibit,  /** Each dimension is quantized to 2 bits, four values (from consecutive
+                  * dimensions) are packed into each output byte -- the 2-bit analogue of
+                  * packed_nibble's contiguous packing. Densely stored (4x smaller than storing
+                  * the same 2-bit codes in packed_nibble's nibble-width slots); a bits=2
+                  * document in this layout must be promoted to nibble width before an int4 MMA
+                  * against a packed_nibble query. */
   seven_bit,     /** Each dimension is quantized to 7 bits and treated as a signed value. */
   unsigned_byte, /** Each dimension is quantized to 8 bits and treated as an unsigned value. */
 
@@ -111,6 +117,7 @@ struct bbq_quantizer {
       case bbq_code_layout::single_bit: return (d * bits + 7) / 8;
       case bbq_code_layout::dibit: return bits * ((d + 7) / 8);
       case bbq_code_layout::packed_nibble: return (d + 1) / 2;
+      case bbq_code_layout::packed_dibit: return (d + 3) / 4;
       case bbq_code_layout::seven_bit: return d;
       case bbq_code_layout::unsigned_byte: return d;
       case bbq_code_layout::transpose_half_byte: return 4 * ((d + 7) / 8);
