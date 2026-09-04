@@ -465,7 +465,8 @@ __device__ ResultItem<Index_t> get_min_item(const Index_t id,
                                             const int idx_in_list,
                                             const Index_t* neighbs,
                                             const DistData_t* distances,
-                                            const bool find_in_row = true)
+                                            const bool find_in_row = true,
+                                            const int stride       = SKEWED_MAX_NUM_BI_SAMPLES)
 {
   int lane_id = threadIdx.x % raft::warp_size();
 
@@ -477,15 +478,13 @@ __device__ ResultItem<Index_t> get_min_item(const Index_t id,
   idx[1]                                             = raft::warp_size() + lane_id;
 
   if (neighbs[idx[0]] != id) {
-    dist[0] = find_in_row ? distances[idx_in_list * SKEWED_MAX_NUM_BI_SAMPLES + lane_id]
-                          : distances[idx_in_list + lane_id * SKEWED_MAX_NUM_BI_SAMPLES];
+    dist[0] = find_in_row ? distances[idx_in_list * stride + lane_id]
+                          : distances[idx_in_list + lane_id * stride];
   }
 
   if (neighbs[idx[1]] != id) {
-    dist[1] =
-      find_in_row
-        ? distances[idx_in_list * SKEWED_MAX_NUM_BI_SAMPLES + raft::warp_size() + lane_id]
-        : distances[idx_in_list + (raft::warp_size() + lane_id) * SKEWED_MAX_NUM_BI_SAMPLES];
+    dist[1] = find_in_row ? distances[idx_in_list * stride + raft::warp_size() + lane_id]
+                          : distances[idx_in_list + (raft::warp_size() + lane_id) * stride];
   }
 
   if (dist[1] < dist[0]) {
@@ -666,13 +665,14 @@ __device__ inline void calculate_metric_bbq_symmetric(
   const bbq_device_quantizer_view<DataT, int64_t> quantizer,
   DistData_t* l2_norms,
   cuvs::distance::DistanceType metric,
-  DistEpilogue_t dist_epilogue)
+  DistEpilogue_t dist_epilogue,
+  const int stride = SKEWED_MAX_NUM_BI_SAMPLES)
 {
   const bool can_postprocess_dist = std::is_same_v<DistEpilogue_t, raft::identity_op>;
 
-  for (int i = threadIdx.x; i < MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES; i += blockDim.x) {
-    const int row_id = i / SKEWED_MAX_NUM_BI_SAMPLES;
-    const int col_id = i % SKEWED_MAX_NUM_BI_SAMPLES;
+  for (int i = threadIdx.x; i < MAX_NUM_BI_SAMPLES * stride; i += blockDim.x) {
+    const int row_id = i / stride;
+    const int col_id = i % stride;
 
     if (row_id < list_row_size && col_id < list_col_size) {
       const Index_t row    = row_neighbors[row_id];
@@ -1625,6 +1625,409 @@ RAFT_KERNEL local_join_kernel_bbq_symmetric(const Index_t* graph_new,
   }
 }
 
+// int4 tensor-core version of local_join_kernel_bbq_symmetric, packed_nibble only. Modeled on
+// local_join_kernel_wmma: nvcuda::wmma fragments (u4 x u4 -> s32, shape m8n8k32) replace the
+// popc/dp4a inner product; the accumulator lives in registers across the whole K reduction and is
+// stored to s_distances_u32 once per (row-tile, col-tile), not accumulated into shared memory
+// every step like the scalar kernel. v1: separate s_distances_u32 buffer (no s_ov aliasing yet).
+//
+// Warp tiling: num_warps = BLOCK_SIZE/32 warps arranged as a WARPS_PER_DIM x WARPS_PER_DIM square
+// grid (WARPS_PER_DIM=4 so 4x4=16=num_warps), each warp owning a (MAX_NUM_BI_SAMPLES/WARPS_PER_DIM)
+// region of the MAX_NUM_BI_SAMPLES x MAX_NUM_BI_SAMPLES output matrix, same as
+// local_join_kernel_wmma's WMMA_M=N=16 warp assignment. Since int4 MMA tiles are MMA_M x MMA_N
+// (8x8, the only shape nvcuda::wmma exposes for u4), each warp covers its region via a
+// SUB_PER_DIM x SUB_PER_DIM grid of native tiles instead of a single call -- SUB_PER_DIM is a
+// forced consequence of (MAX_NUM_BI_SAMPLES/MMA_M) / WARPS_PER_DIM, not an arbitrary choice.
+template <bbq_layout Layout,
+          typename DataT,
+          typename Index_t,
+          typename ID_t = InternalID_t<Index_t>,
+          typename DistEpilogue_t>
+RAFT_KERNEL
+#ifdef __CUDA_ARCH__
+#if (__CUDA_ARCH__) == 700 || (__CUDA_ARCH__) == 800 || (__CUDA_ARCH__) == 900 || \
+  (__CUDA_ARCH__) == 1000
+__launch_bounds__(BLOCK_SIZE, 4)
+#else
+__launch_bounds__(BLOCK_SIZE)
+#endif
+#endif
+  local_join_kernel_bbq_symmetric_int4(const Index_t* graph_new,
+                                       const Index_t* rev_graph_new,
+                                       const int2* sizes_new,
+                                       const Index_t* graph_old,
+                                       const Index_t* rev_graph_old,
+                                       const int2* sizes_old,
+                                       const int width,
+                                       const bbq_device_quantizer_view<DataT, int64_t> dataset,
+                                       ID_t* graph,
+                                       DistData_t* dists,
+                                       int graph_width,
+                                       int* locks,
+                                       DistData_t* l2_norms,
+                                       cuvs::distance::DistanceType metric,
+                                       DistEpilogue_t dist_epilogue)
+{
+#if (__CUDA_ARCH__ >= 750)
+  static_assert(Layout == bbq_layout::packed_nibble,
+                "local_join_kernel_bbq_symmetric_int4 only supports packed_nibble for now");
+  using namespace nvcuda;
+  constexpr int MMA_M = 8;
+  constexpr int MMA_N = 8;
+  constexpr int MMA_K = 32;
+  // num_warps = BLOCK_SIZE/32 = 16, arranged as a square WARPS_PER_DIM x WARPS_PER_DIM grid since
+  // 4*4=16 matches exactly; the static_assert is what actually enforces this holds for the
+  // current BLOCK_SIZE, WARPS_PER_DIM itself isn't derived (no trivial constexpr integer sqrt).
+  constexpr int WARPS_PER_DIM = 4;
+  static_assert(WARPS_PER_DIM * WARPS_PER_DIM == BLOCK_SIZE / raft::warp_size(),
+                "warp grid must be square and match num_warps = BLOCK_SIZE/32");
+  // Each warp owns a WARP_TILE x WARP_TILE region of the MAX_NUM_BI_SAMPLES x MAX_NUM_BI_SAMPLES
+  // output matrix. TILES_PER_DIM is how many native MMA_M x MMA_N tiles span one output dimension;
+  // SUB_PER_DIM (native tiles per warp per dim) is a forced consequence of TILES_PER_DIM /
+  // WARPS_PER_DIM, not an arbitrary choice -- it's 2 here only because 8/4=2 for these particular
+  // MAX_NUM_BI_SAMPLES/MMA_M/WARPS_PER_DIM values.
+  static_assert(MAX_NUM_BI_SAMPLES % MMA_M == 0 && MMA_M == MMA_N,
+                "MAX_NUM_BI_SAMPLES must divide evenly into square MMA_MxMMA_N tiles");
+  constexpr int TILES_PER_DIM = MAX_NUM_BI_SAMPLES / MMA_M;
+  static_assert(TILES_PER_DIM % WARPS_PER_DIM == 0,
+                "warps must evenly tile the native MMA tiles in each output dimension");
+  constexpr int SUB_PER_DIM = TILES_PER_DIM / WARPS_PER_DIM;
+  constexpr int WARP_TILE   = SUB_PER_DIM * MMA_M;
+
+  // Same 128 B staging tile as the scalar packed_nibble kernel -- v1 keeps this unchanged so only
+  // the inner-product mechanism (MMA vs popc/dp4a) differs, not the SMEM staging strategy.
+  // Row stride is BBQ_ROW_BYTES + MMA_PAD, not just BBQ_ROW_BYTES: sub-byte IMMA loads need at
+  // least 16-byte row alignment, and MMA_PAD must be a multiple of 16 to preserve that -- but
+  // BBQ_ROW_BYTES=128 alone is *also* exactly 32 shared-memory banks (4 B/bank), so every row
+  // would land on the same bank offset and any multi-row access load_matrix_sync does internally
+  // would conflict. MMA_PAD=16 breaks that exact-32-bank alignment (144 B/row is not a multiple
+  // of 128 B) while staying a multiple of 16 for the IMMA alignment requirement.
+  constexpr int BBQ_ROW_BYTES = 128;
+  constexpr int MMA_PAD       = 16;
+  static_assert(MMA_PAD % 16 == 0, "row padding must preserve 16-byte IMMA row alignment");
+  constexpr int ELEMS_PER_TILE   = BBQ_ROW_BYTES * 2;  // 2 u4 elements/byte
+  constexpr int K_STEPS_PER_TILE = ELEMS_PER_TILE / MMA_K;
+  constexpr int ROW_STRIDE_U4    = (BBQ_ROW_BYTES + MMA_PAD) * 2;  // row-to-row stride, u4 elements
+  // v1.3 tried decoupling this from SKEWED_MAX_NUM_BI_SAMPLES (get_min_item/
+  // calculate_metric_bbq_symmetric take stride as a parameter for exactly this) with a custom
+  // MMA_STORE_STRIDE=72: store bank conflicts dropped ~4.2x, but overall cycles/duration were
+  // flat, so it wasn't earning its complexity -- reverted back to the shared constant.
+  constexpr int MMA_STORE_STRIDE = SKEWED_MAX_NUM_BI_SAMPLES;
+
+  __shared__ int s_list[MAX_NUM_BI_SAMPLES * 2];
+  __shared__ __align__(16) uint8_t s_nv[MAX_NUM_BI_SAMPLES][BBQ_ROW_BYTES + MMA_PAD];
+  __shared__ __align__(16) uint8_t s_ov[MAX_NUM_BI_SAMPLES][BBQ_ROW_BYTES + MMA_PAD];
+  __shared__ uint32_t s_distances_u32[MAX_NUM_BI_SAMPLES * MMA_STORE_STRIDE];
+  __shared__ int s_unique_counter[2];
+  float* s_distances = reinterpret_cast<float*>(s_distances_u32);
+
+  if (threadIdx.x == 0) {
+    s_unique_counter[0] = 0;
+    s_unique_counter[1] = 0;
+  }
+
+  Index_t* new_neighbors = s_list;
+  Index_t* old_neighbors = s_list + MAX_NUM_BI_SAMPLES;
+  const size_t list_id   = blockIdx.x;
+  const int2 new_size2   = sizes_new[list_id];
+  const int2 old_size2   = sizes_old[list_id];
+  int new_size           = new_size2.x + new_size2.y;
+  int old_size           = old_size2.x + old_size2.y;
+  const int tx           = threadIdx.x;
+
+  if (!new_size) return;
+  if (tx < new_size2.x) {
+    new_neighbors[tx] = graph_new[list_id * width + tx];
+  } else if (tx < new_size) {
+    new_neighbors[tx] = rev_graph_new[list_id * width + tx - new_size2.x];
+  }
+  if (tx < old_size2.x) {
+    old_neighbors[tx] = graph_old[list_id * width + tx];
+  } else if (tx < old_size) {
+    old_neighbors[tx] = rev_graph_old[list_id * width + tx - old_size2.x];
+  }
+  __syncthreads();
+
+  remove_duplicates(
+    new_neighbors, new_size2.x, new_neighbors + new_size2.x, new_size2.y, s_unique_counter[0], 0);
+  remove_duplicates(
+    old_neighbors, old_size2.x, old_neighbors + old_size2.x, old_size2.y, s_unique_counter[1], 1);
+  __syncthreads();
+  new_size = new_size2.x + s_unique_counter[0];
+  old_size = old_size2.x + s_unique_counter[1];
+
+  const int warp_id       = threadIdx.x / raft::warp_size();
+  const int lane_id       = threadIdx.x % raft::warp_size();
+  constexpr int num_warps = BLOCK_SIZE / raft::warp_size();
+  const size_t encoded_row_length =
+    cuvs::preprocessing::quantize::bbq::get_encoded_row_length(dataset);
+  // packed_nibble: n_planes = 1.
+  const size_t plane_bytes     = encoded_row_length;
+  constexpr int plane_tile     = BBQ_ROW_BYTES;
+  const int plane_extent       = static_cast<int>(plane_bytes) / 4;
+  constexpr int plane_tile_u32 = plane_tile / 4;
+  const int n_tiles            = raft::ceildiv(static_cast<int>(plane_bytes), plane_tile);
+
+  const int warp_id_y = warp_id / WARPS_PER_DIM;
+  const int warp_id_x = warp_id % WARPS_PER_DIM;
+
+  // ---- Phase 1: new x new ----
+  {
+    wmma::fragment<wmma::accumulator, MMA_M, MMA_N, MMA_K, int> c_frag[SUB_PER_DIM][SUB_PER_DIM];
+#pragma unroll
+    for (int msub = 0; msub < SUB_PER_DIM; ++msub) {
+#pragma unroll
+      for (int nsub = 0; nsub < SUB_PER_DIM; ++nsub) {
+        wmma::fill_fragment(c_frag[msub][nsub], 0);
+      }
+    }
+
+    for (int step = 0; step < n_tiles; ++step) {
+      const bool last_tile = (step == n_tiles - 1);
+      const int num_load =
+        last_tile ? static_cast<int>(plane_bytes) - step * plane_tile : plane_tile;
+      const int num_load_u32 = num_load / 4;
+      const size_t base      = static_cast<size_t>(step) * plane_tile;
+      for (int i = 0; i < MAX_NUM_BI_SAMPLES / num_warps; ++i) {
+        const int idx = i * num_warps + warp_id;
+        if (idx < new_size) {
+          auto* s_nv_u32 = reinterpret_cast<uint32_t*>(s_nv[idx]);
+          load_vec_bbq<1>(
+            s_nv_u32,
+            reinterpret_cast<const uint32_t*>(&dataset.codes(new_neighbors[idx], base)),
+            plane_extent,
+            num_load_u32,
+            plane_tile_u32,
+            lane_id);
+          if (last_tile) { zero_pad_bbq<1>(s_nv_u32, num_load_u32, plane_tile_u32, lane_id); }
+        }
+      }
+      __syncthreads();
+
+      // a_frag depends only on (msub, kk); b_frag depends only on (nsub, kk) -- load each once
+      // per kk and reuse across the other sub-tile index, instead of reloading redundantly inside
+      // a full msub x nsub x kk cross product.
+      // Deliberately not #pragma unroll'd: full unrolling here keeps more fragment live ranges
+      // simultaneous, driving register pressure up (64/thread, tied with SMEM for the occupancy
+      // cap) -- letting the compiler pick reduces that at the cost of some intra-warp ILP, worth
+      // it only if it actually lowers registers/thread; verify via NCU before/after.
+      for (int kk = 0; kk < K_STEPS_PER_TILE; ++kk) {
+        wmma::fragment<wmma::matrix_a,
+                       MMA_M,
+                       MMA_N,
+                       MMA_K,
+                       wmma::experimental::precision::u4,
+                       wmma::row_major>
+          a_frag[SUB_PER_DIM];
+        wmma::fragment<wmma::matrix_b,
+                       MMA_M,
+                       MMA_N,
+                       MMA_K,
+                       wmma::experimental::precision::u4,
+                       wmma::col_major>
+          b_frag[SUB_PER_DIM];
+#pragma unroll
+        for (int msub = 0; msub < SUB_PER_DIM; ++msub) {
+          const int row0 = warp_id_y * WARP_TILE + msub * MMA_M;
+          wmma::load_matrix_sync(a_frag[msub], s_nv[row0] + kk * (MMA_K / 2), ROW_STRIDE_U4);
+        }
+#pragma unroll
+        for (int nsub = 0; nsub < SUB_PER_DIM; ++nsub) {
+          const int col0 = warp_id_x * WARP_TILE + nsub * MMA_N;
+          wmma::load_matrix_sync(b_frag[nsub], s_nv[col0] + kk * (MMA_K / 2), ROW_STRIDE_U4);
+        }
+#pragma unroll
+        for (int msub = 0; msub < SUB_PER_DIM; ++msub) {
+#pragma unroll
+          for (int nsub = 0; nsub < SUB_PER_DIM; ++nsub) {
+            wmma::mma_sync(c_frag[msub][nsub], a_frag[msub], b_frag[nsub], c_frag[msub][nsub]);
+          }
+        }
+      }
+      __syncthreads();
+    }
+
+#pragma unroll
+    for (int msub = 0; msub < SUB_PER_DIM; ++msub) {
+      const int row0 = warp_id_y * WARP_TILE + msub * MMA_M;
+#pragma unroll
+      for (int nsub = 0; nsub < SUB_PER_DIM; ++nsub) {
+        const int col0 = warp_id_x * WARP_TILE + nsub * MMA_N;
+        wmma::store_matrix_sync(
+          reinterpret_cast<int*>(s_distances_u32) + row0 * MMA_STORE_STRIDE + col0,
+          c_frag[msub][nsub],
+          MMA_STORE_STRIDE,
+          wmma::mem_row_major);
+      }
+    }
+    __syncthreads();
+  }
+
+  calculate_metric_bbq_symmetric(s_distances,
+                                 s_distances_u32,
+                                 new_neighbors,
+                                 new_size,
+                                 new_neighbors,
+                                 new_size,
+                                 dataset,
+                                 l2_norms,
+                                 metric,
+                                 dist_epilogue,
+                                 MMA_STORE_STRIDE);
+  __syncthreads();
+
+  for (int step = 0; step < raft::ceildiv(new_size, num_warps); ++step) {
+    const int idx_in_list = step * num_warps + tx / raft::warp_size();
+    if (idx_in_list >= new_size) continue;
+    auto min_elem = get_min_item(
+      s_list[idx_in_list], idx_in_list, new_neighbors, s_distances, true, MMA_STORE_STRIDE);
+    if (min_elem.id() < gridDim.x) {
+      insert_to_global_graph(min_elem, s_list[idx_in_list], graph, dists, graph_width, locks);
+    }
+  }
+
+  if (!old_size) return;
+  __syncthreads();
+
+  // ---- Phase 2: new x old ----
+  {
+    wmma::fragment<wmma::accumulator, MMA_M, MMA_N, MMA_K, int> c_frag[SUB_PER_DIM][SUB_PER_DIM];
+#pragma unroll
+    for (int msub = 0; msub < SUB_PER_DIM; ++msub) {
+#pragma unroll
+      for (int nsub = 0; nsub < SUB_PER_DIM; ++nsub) {
+        wmma::fill_fragment(c_frag[msub][nsub], 0);
+      }
+    }
+
+    for (int step = 0; step < n_tiles; ++step) {
+      const bool last_tile = (step == n_tiles - 1);
+      const int num_load =
+        last_tile ? static_cast<int>(plane_bytes) - step * plane_tile : plane_tile;
+      const int num_load_u32 = num_load / 4;
+      const size_t base      = static_cast<size_t>(step) * plane_tile;
+      for (int i = 0; i < MAX_NUM_BI_SAMPLES / num_warps; ++i) {
+        const int idx = i * num_warps + warp_id;
+        if (idx < new_size) {
+          auto* s_nv_u32 = reinterpret_cast<uint32_t*>(s_nv[idx]);
+          load_vec_bbq<1>(
+            s_nv_u32,
+            reinterpret_cast<const uint32_t*>(&dataset.codes(new_neighbors[idx], base)),
+            plane_extent,
+            num_load_u32,
+            plane_tile_u32,
+            lane_id);
+          if (last_tile) { zero_pad_bbq<1>(s_nv_u32, num_load_u32, plane_tile_u32, lane_id); }
+        }
+        if (idx < old_size) {
+          auto* s_ov_u32 = reinterpret_cast<uint32_t*>(s_ov[idx]);
+          load_vec_bbq<1>(
+            s_ov_u32,
+            reinterpret_cast<const uint32_t*>(&dataset.codes(old_neighbors[idx], base)),
+            plane_extent,
+            num_load_u32,
+            plane_tile_u32,
+            lane_id);
+          if (last_tile) { zero_pad_bbq<1>(s_ov_u32, num_load_u32, plane_tile_u32, lane_id); }
+        }
+      }
+      __syncthreads();
+
+#pragma unroll
+      for (int kk = 0; kk < K_STEPS_PER_TILE; ++kk) {
+        wmma::fragment<wmma::matrix_a,
+                       MMA_M,
+                       MMA_N,
+                       MMA_K,
+                       wmma::experimental::precision::u4,
+                       wmma::row_major>
+          a_frag[SUB_PER_DIM];
+        wmma::fragment<wmma::matrix_b,
+                       MMA_M,
+                       MMA_N,
+                       MMA_K,
+                       wmma::experimental::precision::u4,
+                       wmma::col_major>
+          b_frag[SUB_PER_DIM];
+#pragma unroll
+        for (int msub = 0; msub < SUB_PER_DIM; ++msub) {
+          const int row0 = warp_id_y * WARP_TILE + msub * MMA_M;
+          wmma::load_matrix_sync(a_frag[msub], s_nv[row0] + kk * (MMA_K / 2), ROW_STRIDE_U4);
+        }
+#pragma unroll
+        for (int nsub = 0; nsub < SUB_PER_DIM; ++nsub) {
+          const int col0 = warp_id_x * WARP_TILE + nsub * MMA_N;
+          wmma::load_matrix_sync(b_frag[nsub], s_ov[col0] + kk * (MMA_K / 2), ROW_STRIDE_U4);
+        }
+#pragma unroll
+        for (int msub = 0; msub < SUB_PER_DIM; ++msub) {
+#pragma unroll
+          for (int nsub = 0; nsub < SUB_PER_DIM; ++nsub) {
+            wmma::mma_sync(c_frag[msub][nsub], a_frag[msub], b_frag[nsub], c_frag[msub][nsub]);
+          }
+        }
+      }
+      __syncthreads();
+    }
+
+#pragma unroll
+    for (int msub = 0; msub < SUB_PER_DIM; ++msub) {
+      const int row0 = warp_id_y * WARP_TILE + msub * MMA_M;
+#pragma unroll
+      for (int nsub = 0; nsub < SUB_PER_DIM; ++nsub) {
+        const int col0 = warp_id_x * WARP_TILE + nsub * MMA_N;
+        wmma::store_matrix_sync(
+          reinterpret_cast<int*>(s_distances_u32) + row0 * MMA_STORE_STRIDE + col0,
+          c_frag[msub][nsub],
+          MMA_STORE_STRIDE,
+          wmma::mem_row_major);
+      }
+    }
+    __syncthreads();
+  }
+
+  calculate_metric_bbq_symmetric(s_distances,
+                                 s_distances_u32,
+                                 new_neighbors,
+                                 new_size,
+                                 old_neighbors,
+                                 old_size,
+                                 dataset,
+                                 l2_norms,
+                                 metric,
+                                 dist_epilogue,
+                                 MMA_STORE_STRIDE);
+  __syncthreads();
+
+  for (int step = 0; step < raft::ceildiv(MAX_NUM_BI_SAMPLES * 2, num_warps); ++step) {
+    const int idx_in_list = step * num_warps + tx / raft::warp_size();
+    if (idx_in_list >= new_size && idx_in_list < MAX_NUM_BI_SAMPLES) continue;
+    if (idx_in_list >= MAX_NUM_BI_SAMPLES + old_size && idx_in_list < MAX_NUM_BI_SAMPLES * 2) {
+      continue;
+    }
+
+    ResultItem<Index_t> min_elem{std::numeric_limits<Index_t>::max(),
+                                 std::numeric_limits<DistData_t>::max()};
+    if (idx_in_list < MAX_NUM_BI_SAMPLES) {
+      auto temp_min_item = get_min_item(
+        s_list[idx_in_list], idx_in_list, old_neighbors, s_distances, true, MMA_STORE_STRIDE);
+      if (temp_min_item.dist() < min_elem.dist()) { min_elem = temp_min_item; }
+    } else {
+      auto temp_min_item = get_min_item(s_list[idx_in_list],
+                                        idx_in_list - MAX_NUM_BI_SAMPLES,
+                                        new_neighbors,
+                                        s_distances,
+                                        false,
+                                        MMA_STORE_STRIDE);
+      if (temp_min_item.dist() < min_elem.dist()) { min_elem = temp_min_item; }
+    }
+    if (min_elem.id() < gridDim.x) {
+      insert_to_global_graph(min_elem, s_list[idx_in_list], graph, dists, graph_width, locks);
+    }
+  }
+#endif  // __CUDA_ARCH__ >= 750
+}
+
 // launch_bounds here denote BLOCK_SIZE = 512 and MIN_BLOCKS_PER_SM = 4
 // Per
 // https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#features-and-technical-specifications,
@@ -2373,6 +2776,9 @@ void GNND<Data_t, Index_t>::local_join(cudaStream_t stream,
     if (build_config_.metric == cuvs::distance::DistanceType::CosineExpanded) {
       raft::linalg::map_offset(res, l2_norms_.view(), bbq::bbq_row_norm_op{quantizer});
     }
+    // nnd-bbq-tc: packed_nibble goes through the int4 tensor-core path; single_bit/dibit are kept
+    // on the original scalar popc/dp4a path as reference points. transpose_half_byte/seven_bit/
+    // unsigned_byte were dropped from this branch's dispatch (see TENSOR_CORE_NOTES.md).
     auto launch_symmetric = [&](auto layout) {
       constexpr auto Layout = decltype(layout)::value;
       local_join_kernel_bbq_symmetric<Layout>
@@ -2399,19 +2805,42 @@ void GNND<Data_t, Index_t>::local_join(cudaStream_t stream,
       case bbq_layout::dibit:
         launch_symmetric(std::integral_constant<bbq_layout, bbq_layout::dibit>{});
         break;
-      case bbq_layout::packed_nibble:
-        launch_symmetric(std::integral_constant<bbq_layout, bbq_layout::packed_nibble>{});
+      case bbq_layout::packed_nibble: {
+        // int4 sub-byte tensor-core MMA (nvcuda::wmma experimental::precision::u4, guarded by
+        // __CUDA_ARCH__ >= 750 inside the kernel) is not supported on Blackwell (compute
+        // capability >= 10.0) -- the device-side guard alone would just silently compile the
+        // kernel body to a no-op there, not fail loudly. Mirror the existing WMMA arch check
+        // above (uses any kernel from the same translation unit as an architecture proxy, since
+        // kernel_virtual_arch only needs to know what this compilation unit was built for, not
+        // this specific kernel's exact template instantiation).
+        auto proxy_kernel = compute_l2_norms_kernel<float>;
+        auto runtime_arch =
+          raft::util::arch::kernel_virtual_arch(reinterpret_cast<void*>(proxy_kernel));
+        auto int4_mma_range = raft::util::arch::SM_range(
+          raft::util::arch::SM_75(), raft::util::arch::detail::SM_generic<1000>());
+        RAFT_EXPECTS(int4_mma_range.contains(runtime_arch),
+                     "local_join_kernel_bbq_symmetric_int4 requires int4 tensor-core MMA support "
+                     "(compute capability >= 7.5 and < 10.0 / Blackwell); current runtime "
+                     "architecture is unsupported.");
+        local_join_kernel_bbq_symmetric_int4<bbq_layout::packed_nibble>
+          <<<nrow_, BLOCK_SIZE, 0, stream>>>(graph_.h_graph_new.data_handle(),
+                                             h_rev_graph_new_.data_handle(),
+                                             d_list_sizes_new_.data_handle(),
+                                             h_graph_old_.data_handle(),
+                                             h_rev_graph_old_.data_handle(),
+                                             d_list_sizes_old_.data_handle(),
+                                             NUM_SAMPLES,
+                                             quantizer,
+                                             graph_buffer_.data_handle(),
+                                             dists_buffer_.data_handle(),
+                                             DEGREE_ON_DEVICE,
+                                             d_locks_.data_handle(),
+                                             l2_norms_.data_handle(),
+                                             build_config_.metric,
+                                             dist_epilogue);
         break;
-      case bbq_layout::transpose_half_byte:
-        launch_symmetric(std::integral_constant<bbq_layout, bbq_layout::transpose_half_byte>{});
-        break;
-      case bbq_layout::seven_bit:
-        launch_symmetric(std::integral_constant<bbq_layout, bbq_layout::seven_bit>{});
-        break;
-      case bbq_layout::unsigned_byte:
-        launch_symmetric(std::integral_constant<bbq_layout, bbq_layout::unsigned_byte>{});
-        break;
-      default: RAFT_FAIL("Unsupported BBQ layout for symmetric local join.");
+      }
+      default: RAFT_FAIL("Unsupported BBQ layout for symmetric local join on this branch.");
     }
   }
   RAFT_CUDA_TRY(cudaPeekAtLastError());
