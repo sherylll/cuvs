@@ -6,9 +6,12 @@ with `u4xu4->s32` `nvcuda::wmma` MMA (`m8n8k32`), modeled on `local_join_kernel_
 fragment/accumulator pattern. Dispatch (`GNND::local_join`): symmetric `packed_nibble` -> int4
 tensor-core path (`single_bit`/`dibit` kept on the original scalar popc/dp4a path as reference
 points; `transpose_half_byte`/`seven_bit`/`unsigned_byte` dropped from this branch's symmetric
-dispatch, `RAFT_FAIL` on those); asymmetric `packed_nibble`(bits=2) x `packed_nibble`(bits=4) ->
-int4 tensor-core path (see "Asymmetric int4" below; other asymmetric pairs -- `single_bit`+`dibit`,
-`single_bit`+`transpose_half_byte`, `dibit`+`transpose_half_byte` -- stay on the scalar path).
+dispatch, `RAFT_FAIL` on those); asymmetric `packed_dibit`(bits=2) or `single_bit`(bits=1)
+document x `packed_nibble`(bits=4) query -> int4 tensor-core path (see "Asymmetric int4" below).
+This is the *only* asymmetric path this branch supports -- the scalar asymmetric kernel and its
+other pairs (`single_bit`+`dibit`, `single_bit`+`transpose_half_byte`, `dibit`+`transpose_half_byte`)
+were removed once int4 covered the pairs this branch cares about; any other multi-quantizer
+combination now hits `RAFT_FAIL` (see "Fusing calculate_metric_bbq_asymmetric into get_min_item").
 
 int4 sub-byte MMA isn't supported on Blackwell (compute capability >= 10.0) -- the kernel's
 `__CUDA_ARCH__ >= 750` compile-time guard alone would just silently compile to a no-op there, so
@@ -49,8 +52,9 @@ ncu --kernel-name local_join_kernel_bbq_symmetric_int4 \
 | v1.1: hoist redundant fragment loads | 2,649,796 | 1.06 ms | 143,487,983 | halved `load_matrix_sync` calls, `mma_sync` count unchanged |
 | v1.2: pad row stride (break 32-bank alignment) | 1,933,758 | 776 us | 109,198 (below baseline) | `MMA_PAD=16`; 128 B/row was exactly 32 banks |
 | v1.3: custom store stride (tried, reverted) | 1,941,864 | 781 us | -- | store conflicts dropped 4.2x but cycles flat; not worth the added complexity, reverted to shared `SKEWED_MAX_NUM_BI_SAMPLES` |
+| v1.4: fused `get_min_item_fused` (see below) | 1,833,242 | 744.3 us | -- | same fusion applied to the asymmetric kernel, reused here since symmetric is the `document == query` degenerate case of the same math |
 
-**Net: ~2.3x fewer cycles, ~2.45x faster than the scalar baseline**, recall unchanged throughout.
+**Net: ~2.5x fewer cycles, ~2.6x faster than the scalar baseline**, recall unchanged throughout.
 
 Register pressure (64/thread, tied with SMEM at the 2-blocks/SM occupancy cap) was investigated
 but not reduced: removing `#pragma unroll` from the `kk` loop had zero effect, and
@@ -92,6 +96,63 @@ are non-trivial (same root cause as the symmetric kernel's v1.2 finding: `MMA_ST
 SKEWED_MAX_NUM_BI_SAMPLES` isn't bank-friendly) but per that same finding fixing them didn't move
 overall cycles for the symmetric kernel, so it wasn't chased here either.
 
+### Fusing calculate_metric_bbq_* into get_min_item
+
+`s_distances_u32` already held the raw MMA dot products, fully written and synced
+(`__syncthreads()` after `store_matrix_sync`) before `calculate_metric_bbq_asymmetric` ran -- so
+that function wasn't computing anything new, just converting int32 -> float and writing it back
+to the *same* buffer, which `get_min_item` then read again. Replaced both with one function,
+`get_min_item_fused`, that reads the raw dot product and does the metric conversion inline, in
+registers, right before the warp-level min-reduction (`get_min_item` itself is untouched, still
+used by `local_join_kernel_simt`, the scalar `local_join_kernel_bbq_symmetric`, and
+`local_join_kernel_wmma`). This removes one `__syncthreads()` per phase and collapses 3 SMEM
+operations/valid-entry (read raw, write converted, read converted) down to 1 (read raw only);
+invalid (out-of-range) entries now touch SMEM zero times instead of 2, since the bounds check
+happens entirely from registers before any buffer access. The arithmetic itself (the metric
+conversion) is unchanged -- same set of `(row, col)` pairs, computed exactly once either way; the
+win is purely in memory traffic and barriers, not FLOP count.
+
+`get_min_item_fused` turned out not to need an asymmetric-specific and symmetric-specific variant.
+`bbq.cuh`'s two-quantizer `centered_dot`/`l2_distance`/`dot_product`/`cosine_distance` overloads
+are exact generalizations of their single-quantizer counterparts -- verified directly against the
+header: e.g. two-quantizer `dot_product(doc, query, centered, row_doc, row_query)` reduces to
+`centered + doc.additional_corrections(row_doc) + query.additional_corrections(row_query) -
+doc.centroid_norm_sq`, bit-for-bit the single-quantizer formula when `doc == query`. So
+`local_join_kernel_bbq_symmetric_int4` calls the exact same `get_min_item_fused`, just passing
+`quantizer_document == quantizer_query == dataset` (and `l2_norms_document == l2_norms_query ==
+l2_norms`). This also let `calculate_metric_bbq_symmetric`'s two call sites in the int4 symmetric
+kernel go away, though the function itself stays (still used by the scalar
+`local_join_kernel_bbq_symmetric`). Result: 1,933,758 -> 1,833,242 cycles (~5.2% fewer), smaller
+than the asymmetric case's ~11% since the symmetric kernel's `new x new` phase already avoided
+some SMEM round-tripping (one shared buffer, no doc/query split) -- but still a real, recall-
+unchanged win with the same code reused, not a new implementation.
+
+At the same time, removed the scalar `local_join_kernel_bbq_asymmetric` kernel and its three
+non-int4-covered pairs (`single_bit`+`dibit`, `single_bit`+`transpose_half_byte`,
+`dibit`+`transpose_half_byte`) entirely, along with `calculate_metric_bbq_asymmetric`, now dead.
+`GNND::local_join`'s asymmetric dispatch simplified to the one supported case
+(`packed_dibit`|`single_bit` document x `packed_nibble` query); any other multi-quantizer
+combination now hits a clear `RAFT_FAIL` instead of the kernel that used to handle it. Caught one
+real bug while doing this: `use_asymmetric`'s condition was tightened to only fire when
+`packed_nibble` was present, which meant an unsupported pair like `single_bit`+`dibit` silently
+fell through to the *symmetric* branch and computed a `single_bit` self-join instead --
+recall looked plausible (0.581, matching the known symmetric `single_bit` reference number) but
+was silently the wrong computation, not a graceful failure. Fixed by making `use_asymmetric` true
+for any `quantizers.size() > 1` again (matching the pre-removal behavior) and moving the
+"supported pair" check to an explicit `RAFT_EXPECTS` inside, so an unsupported pair now fails
+loudly instead of silently computing something else.
+
+| Kernel | Cycles | Duration | Store bank conflicts |
+|---|---:|---:|---:|
+| `2p+4`, before fusion | 2,485,943 | 992.5 us | 1,821,046 |
+| `2p+4`, after fusion | 2,215,454 | 886.9 us | 1,716,631 |
+| `1+4`, before fusion | 2,578,307 | 1.03 ms | 1,787,587 |
+| `1+4`, after fusion | 2,291,157 | 913.7 us | 1,645,401 |
+
+**~11% fewer cycles for both**, recall unchanged, matching the memory-traffic-reduction
+prediction. Store bank conflicts dropped modestly (6-8%) but remain the dominant cost by a wide
+margin -- still the next thing worth digging into, not the barrier/traffic reduction here.
+
 ### 1x4 (`single_bit` document)
 
 Same kernel, templated on `DocumentLayout` (`bbq_layout::packed_dibit` or `bbq_layout::single_bit`)
@@ -130,8 +191,8 @@ dp4a/popc:
 | Kernel | Cycles | Speedup vs `local_join_kernel_wmma` (2,826,551 cycles) |
 |---|---:|---:|
 | Symmetric `4x4` (`packed_nibble`) | 1,933,758 | ~1.46x |
-| Asymmetric `2x4` (`packed_dibit` doc) | 2,485,943 | ~1.14x |
-| Asymmetric `1x4` (`single_bit` doc, SWAR) | 2,578,307 | ~1.10x |
+| Asymmetric `2x4` (`packed_dibit` doc, post-fusion) | 2,215,454 | ~1.28x |
+| Asymmetric `1x4` (`single_bit` doc, SWAR, post-fusion) | 2,291,157 | ~1.23x |
 
 ### Why asymmetric is slower than symmetric (not DRAM bandwidth -- SMEM write volume)
 
@@ -224,6 +285,23 @@ number), forcing the same K-tiled streaming structure the real int4 kernels ende
 - `BLOCK_SIZE=1024` (1:1 tile:warp mapping, no sub-tile loop) was considered and ruled out: L40S
   caps at 1536 resident threads/SM, so 1024 threads/block would cap occupancy at 1 block/SM,
   worse than today's 2.
+- **`MAX_NUM_BI_SAMPLES=64` -> `32` (with `NUM_SAMPLES` halved to `16` to keep the `2x` relationship
+  and avoid uncontrolled candidate-list truncation)**: discussed, not attempted. Blocked on
+  `get_min_item`'s `static_assert(MAX_NUM_BI_SAMPLES == 64)` (hard-wired to 2 elements/lane across
+  a 32-lane warp; needs rewriting, not a constant bump), and other possible hidden 64-assumptions
+  (`SKEWED_MAX_NUM_BI_SAMPLES`, the scalar kernels' loops) were never audited. Would also collapse
+  the int4 kernels' `SUB_PER_DIM` from 2 to 1 (`WARP_TILE` becomes exactly the native 8x8 MMA
+  tile, no sub-tile loop), a likely register-pressure win independent of the recall question. Real
+  risk: NN-descent convergence is sensitive to candidates-per-round, so recall must be measured
+  directly, not assumed -- could mean more iterations needed for the same recall, or lower recall
+  at the harness's fixed iteration budget.
+- **Store bank conflicts remain high** even after v1.2's row-padding fix and the `SKEWED_MAX_NUM_BI_SAMPLES`
+  store stride (documented per-kernel above: 1.8-1.9M store conflicts for the asymmetric kernels).
+  Next thing to dig into: `store_matrix_sync`'s own per-thread-to-address mapping for an 8x8 int32
+  (4 B) tile may be the actual source, not just the outer row stride -- v1.3's custom store stride
+  (`MMA_STORE_STRIDE=72`) cut conflicts 4.2x but didn't move cycles, which is itself a clue that
+  store conflicts as currently measured may not be the true bottleneck; worth understanding why
+  before trying another stride value.
 
 See `git log` on this branch for the incremental progression; each stage above was independently
 measured and recall-verified before moving to the next.
