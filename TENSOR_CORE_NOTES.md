@@ -7,11 +7,11 @@ fragment/accumulator pattern. Dispatch (`GNND::local_join`): symmetric `packed_n
 tensor-core path (`single_bit`/`dibit` kept on the original scalar popc/dp4a path as reference
 points; `transpose_half_byte`/`seven_bit`/`unsigned_byte` dropped from this branch's symmetric
 dispatch, `RAFT_FAIL` on those); asymmetric `packed_dibit`(bits=2) or `single_bit`(bits=1)
-document x `packed_nibble`(bits=4) query -> int4 tensor-core path (see "Asymmetric int4" below).
-This is the *only* asymmetric path this branch supports -- the scalar asymmetric kernel and its
-other pairs (`single_bit`+`dibit`, `single_bit`+`transpose_half_byte`, `dibit`+`transpose_half_byte`)
-were removed once int4 covered the pairs this branch cares about; any other multi-quantizer
-combination now hits `RAFT_FAIL` (see "Fusing calculate_metric_bbq_asymmetric into get_min_item").
+document x `packed_nibble`(bits=4) query -> int4 tensor-core path. That is the *only* asymmetric
+path this branch supports -- the scalar asymmetric kernel and its other pairs
+(`single_bit`+`dibit`, `single_bit`+`transpose_half_byte`, `dibit`+`transpose_half_byte`) were
+removed once int4 covered the pairs this branch cares about; any other multi-quantizer combination
+now hits `RAFT_FAIL`.
 
 int4 sub-byte MMA isn't supported on Blackwell (compute capability >= 10.0) -- the kernel's
 `__CUDA_ARCH__ >= 750` compile-time guard alone would just silently compile to a no-op there, so
@@ -29,6 +29,59 @@ ncu --kernel-name local_join_kernel_bbq_symmetric_int4 \
   ./my_tests/bbq/build/bbq_nn_descent_comparison --data-file=/tmp/data/base1_falcon_1024_1M.fbin 4 4 1
 ```
 
+## Timeline
+
+Sections below are in the order the work actually happened; each stage was independently measured
+and recall-verified before moving to the next.
+
+0. SOL analysis -- pre-implementation, motivated building any of this.
+1. Symmetric int4 `4x4` (`packed_nibble`) -- commit `639e3974`.
+2. Asymmetric int4 `2x4` (`packed_dibit` document) -- commit `ec22ee29`.
+3. Asymmetric int4 `1x4` (`single_bit` document) -- commit `3c087872`.
+4. Metric-computation fusion into the min-search, applied to the asymmetric kernels first and then
+   reused unchanged for the symmetric one; scalar asymmetric kernel removed in the same change --
+   commit `d8f4efd3`.
+
+The cross-kernel analysis sections (fp16 baseline comparison, "why asymmetric is slower") come
+after all four stages and quote post-fusion numbers throughout.
+
+## 0. Original theoretical motivation: SOL analysis (pre-implementation)
+
+Before any of the int4 kernels existed, this instruction-count model motivated building them:
+`popc = 15 cycles`, `dp4a = 2 cycles`, hypothetical `int8 MMA (m16n8k32) = 4 cycles`, applied to
+the (then-only) scalar `code_inner_product_*_2x1` microkernels. Per-distance MAC-instruction cost,
+`n` = row bytes, `bits` = code bit-width:
+
+| Layout | bits | instr | cycles/distance |
+|---|---:|---|---:|
+| `single_bit` (symmetric) | 1 | popc, `n/4` | 480 |
+| `dibit` (symmetric) | 2 | popc, `bits*(n/4)` | 960 |
+| `transpose_half_byte` (symmetric) | 4 | popc, `bits*(n/4)` | 1920 |
+| `packed_nibble` (symmetric) | 4 | dp4a, `n/8` | 128 |
+| `unsigned_byte` (symmetric) | 8 | dp4a, `n/16` | 64 |
+| 1+2 (asymmetric) | 1+2 | popc, `doc_bits*query_bits*(query_stride/4)` | 480 |
+| 1+4t (asymmetric) | 1+4 | popc, same formula | 480 |
+| 2+4t (asymmetric) | 2+4 | popc, same formula | 960 |
+| int8 tensor core (hypothetical) | 8 | mma, `ceil(K/32)/(16*8)` | 0.125 |
+
+Multi-plane symmetric layouts (`dibit`, `transpose_half_byte`) split the row into `bits` stripes
+and cross every document stripe against every query stripe (`bits^2` sub-calls), so cost scales
+as `bits*(n/4)` -- not free with bit-width. The asymmetric kernel has the same cross-plane
+structure with `doc_bits * query_bits` sub-calls instead of `bits^2`.
+
+**Takeaway at the time:** the encoding, not the bit-width, sets the cost. At equal byte count,
+popc-based layouts cost `15/2 = 7.5x` more per instruction than dp4a-based ones -- 4-bit
+`transpose_half_byte` (1920 cycles/distance) is **15x** more expensive than 4-bit `packed_nibble`
+(128 cycles/distance) at the *same* bit width, purely from the popc-vs-dp4a choice. The
+asymmetric path had no dp4a-based option at the time (no "packed nibble" analogue for either
+operand), so it was stuck paying the popc tax -- exactly the gap `packed_dibit` and `single_bit`'s
+int4 promotion in this branch were built to close. A naive int8/tensor-core promotion looked like
+another large drop in MAC cost on top of that, but was never actually free: caching a full
+int8-promoted row in static shared memory would have pushed several configurations over the
+compile-time static-`__shared__` ceiling common to CUDA GPUs generally (not an L40-specific
+number), forcing the same K-tiled streaming structure the real int4 kernels ended up using anyway
+(`BBQ_ROW_BYTES = 128` in the actual implementation) rather than a single full-row MMA pass.
+
 ## Correctness
 
 1. Isolated GPU probe confirmed `packed_nibble`'s existing byte layout (`byte = low | high<<4`)
@@ -43,7 +96,7 @@ ncu --kernel-name local_join_kernel_bbq_symmetric_int4 \
    `dibit` (scalar) 0.785 -- all comfortably above their respective min-recall thresholds (0.15,
    0.50), dispatch confirmed working for all three together, not just packed_nibble in isolation.
 
-## Results
+## 1. Symmetric int4 `4x4` (`local_join_kernel_bbq_symmetric_int4`)
 
 | Stage | Cycles | Duration | Load bank conflicts | Notes |
 |---|---:|---:|---:|---|
@@ -52,18 +105,19 @@ ncu --kernel-name local_join_kernel_bbq_symmetric_int4 \
 | v1.1: hoist redundant fragment loads | 2,649,796 | 1.06 ms | 143,487,983 | halved `load_matrix_sync` calls, `mma_sync` count unchanged |
 | v1.2: pad row stride (break 32-bank alignment) | 1,933,758 | 776 us | 109,198 (below baseline) | `MMA_PAD=16`; 128 B/row was exactly 32 banks |
 | v1.3: custom store stride (tried, reverted) | 1,941,864 | 781 us | -- | store conflicts dropped 4.2x but cycles flat; not worth the added complexity, reverted to shared `SKEWED_MAX_NUM_BI_SAMPLES` |
-| v1.4: fused `get_min_item_fused` (see below) | 1,833,242 | 744.3 us | -- | same fusion applied to the asymmetric kernel, reused here since symmetric is the `document == query` degenerate case of the same math |
 
-**Net: ~2.5x fewer cycles, ~2.6x faster than the scalar baseline**, recall unchanged throughout.
+**As of this stage: ~2.3x fewer cycles than the scalar baseline**, recall unchanged throughout.
+(Stage 4's fusion later took this to ~2.5x -- see below; it is deliberately not folded into this
+table, since it came after all the asymmetric work.)
 
 Register pressure (64/thread, tied with SMEM at the 2-blocks/SM occupancy cap) was investigated
 but not reduced: removing `#pragma unroll` from the `kk` loop had zero effect, and
 `-Xptxas -v` confirmed 0 bytes spilled -- 64 is a clean allocation, not spill-driven, so the
 register lever appears exhausted without forcing (untried: explicit `maxrregcount` to find the
 real floor). Per the rule "only push SMEM reduction once registers actually drop," the
-`s_ov`-aliasing SMEM idea (see below) was not attempted.
+`s_ov`-aliasing SMEM idea (see "Known follow-ups") was not attempted.
 
-## Asymmetric int4 (`local_join_kernel_bbq_asymmetric_int4`)
+## 2. Asymmetric int4 `2x4` (`local_join_kernel_bbq_asymmetric_int4`)
 
 Extends the same u4xu4 MMA structure to the asymmetric case: 2-bit document x 4-bit query.
 
@@ -96,7 +150,36 @@ are non-trivial (same root cause as the symmetric kernel's v1.2 finding: `MMA_ST
 SKEWED_MAX_NUM_BI_SAMPLES` isn't bank-friendly) but per that same finding fixing them didn't move
 overall cycles for the symmetric kernel, so it wasn't chased here either.
 
-### Fusing calculate_metric_bbq_* into get_min_item
+## 3. Asymmetric int4 `1x4` (`single_bit` document)
+
+Same kernel, templated on `DocumentLayout` (`bbq_layout::packed_dibit` or `bbq_layout::single_bit`)
+so only the promotion function and its native:promoted expansion ratio differ (2x for
+`packed_dibit`, 4x for `single_bit` -- 1 native byte of `single_bit` fully determines 1 promoted
+output word on its own). First cut used a straightforward nested unrolled loop
+(`promote_single_bit_word_to_nibble_quad`, correct but not vectorized), i.e. it did *not* start
+out with the branch-free SWAR treatment `2x4`'s promotion already had. Giving it the same
+treatment (4 lane-wise 2-bit-field extractions + spreads, transposed into the 4 per-native-byte
+output words via chained `__byte_perm` pairs, since one `__byte_perm` call only reaches 2 of the 4
+field-words) cut cycles by ~7.6%, bringing both asymmetric promotions to the same SWAR form.
+Both promotion versions verified against a bit-by-bit reference exhaustively
+(loop version: all 256 byte values; SWAR version: 200k random 32-bit words against the loop
+version).
+
+| Kernel | Cycles | Duration | Recall |
+|---|---:|---:|---:|
+| Scalar `1+4t` (`single_bit` doc x `transpose_half_byte` query) | 3,874,994 | 1.56 ms | 0.743-0.745 |
+| int4 `1+4`, loop-based promotion | 2,791,889 | 1.11 ms | 0.745-0.746 |
+| int4 `1+4`, SWAR/`__byte_perm` promotion | 2,578,307 | 1.03 ms | 0.745-0.746 |
+
+**~1.5x fewer cycles, ~1.5x faster than the scalar baseline** with the SWAR promotion (up from
+~1.4x with the loop version) -- a much smaller margin than `2x4`'s ~2.4x, and `1x4`'s absolute
+cycle count is *higher* than `2x4`'s despite `single_bit`'s native document footprint being half
+of `packed_dibit`'s. See "Why asymmetric is slower than symmetric" below for the full accounting.
+
+## 4. Fusing `calculate_metric_bbq_*` into `get_min_item`
+
+Applied to the asymmetric kernels first, then reused unchanged for the symmetric one -- so this
+stage moves the numbers in sections 1-3 above.
 
 `s_distances_u32` already held the raw MMA dot products, fully written and synced
 (`__syncthreads()` after `store_matrix_sync`) before `calculate_metric_bbq_asymmetric` ran -- so
@@ -122,79 +205,38 @@ doc.centroid_norm_sq`, bit-for-bit the single-quantizer formula when `doc == que
 `quantizer_document == quantizer_query == dataset` (and `l2_norms_document == l2_norms_query ==
 l2_norms`). This also let `calculate_metric_bbq_symmetric`'s two call sites in the int4 symmetric
 kernel go away, though the function itself stays (still used by the scalar
-`local_join_kernel_bbq_symmetric`). Result: 1,933,758 -> 1,833,242 cycles (~5.2% fewer), smaller
-than the asymmetric case's ~11% since the symmetric kernel's `new x new` phase already avoided
-some SMEM round-tripping (one shared buffer, no doc/query split) -- but still a real, recall-
-unchanged win with the same code reused, not a new implementation.
+`local_join_kernel_bbq_symmetric`).
 
-At the same time, removed the scalar `local_join_kernel_bbq_asymmetric` kernel and its three
-non-int4-covered pairs (`single_bit`+`dibit`, `single_bit`+`transpose_half_byte`,
-`dibit`+`transpose_half_byte`) entirely, along with `calculate_metric_bbq_asymmetric`, now dead.
-`GNND::local_join`'s asymmetric dispatch simplified to the one supported case
-(`packed_dibit`|`single_bit` document x `packed_nibble` query); any other multi-quantizer
-combination now hits a clear `RAFT_FAIL` instead of the kernel that used to handle it. Caught one
-real bug while doing this: `use_asymmetric`'s condition was tightened to only fire when
-`packed_nibble` was present, which meant an unsupported pair like `single_bit`+`dibit` silently
-fell through to the *symmetric* branch and computed a `single_bit` self-join instead --
-recall looked plausible (0.581, matching the known symmetric `single_bit` reference number) but
-was silently the wrong computation, not a graceful failure. Fixed by making `use_asymmetric` true
-for any `quantizers.size() > 1` again (matching the pre-removal behavior) and moving the
-"supported pair" check to an explicit `RAFT_EXPECTS` inside, so an unsupported pair now fails
-loudly instead of silently computing something else.
+| Kernel | Cycles before | Cycles after | Duration after | Store bank conflicts (before -> after) |
+|---|---:|---:|---:|---|
+| Symmetric `4x4` | 1,933,758 | 1,833,242 | 744.3 us | -- |
+| Asymmetric `2p+4` | 2,485,943 | 2,215,454 | 886.9 us | 1,821,046 -> 1,716,631 |
+| Asymmetric `1+4` | 2,578,307 | 2,291,157 | 913.7 us | 1,787,587 -> 1,645,401 |
 
-| Kernel | Cycles | Duration | Store bank conflicts |
-|---|---:|---:|---:|
-| `2p+4`, before fusion | 2,485,943 | 992.5 us | 1,821,046 |
-| `2p+4`, after fusion | 2,215,454 | 886.9 us | 1,716,631 |
-| `1+4`, before fusion | 2,578,307 | 1.03 ms | 1,787,587 |
-| `1+4`, after fusion | 2,291,157 | 913.7 us | 1,645,401 |
+**~11% fewer cycles for both asymmetric kernels**, recall unchanged, matching the
+memory-traffic-reduction prediction. The symmetric kernel gained less (~5.2%) because its
+`new x new` phase already avoided some SMEM round-tripping (one shared buffer, no doc/query
+split) -- but it is still a real, recall-unchanged win from reused code, not a new implementation.
+Store bank conflicts dropped modestly (6-8%) but remain the dominant cost by a wide margin --
+still the next thing worth digging into, not the barrier/traffic reduction here.
 
-**~11% fewer cycles for both**, recall unchanged, matching the memory-traffic-reduction
-prediction. Store bank conflicts dropped modestly (6-8%) but remain the dominant cost by a wide
-margin -- still the next thing worth digging into, not the barrier/traffic reduction here.
+Final symmetric standing after this stage: **~2.5x fewer cycles than the scalar baseline**
+(4,516,246 -> 1,833,242), up from ~2.3x at the end of section 1.
 
-### 1x4 (`single_bit` document)
-
-Same kernel, templated on `DocumentLayout` (`bbq_layout::packed_dibit` or `bbq_layout::single_bit`)
-so only the promotion function and its native:promoted expansion ratio differ (2x for
-`packed_dibit`, 4x for `single_bit` -- 1 native byte of `single_bit` fully determines 1 promoted
-output word on its own). First cut used a straightforward nested unrolled loop
-(`promote_single_bit_word_to_nibble_quad`, correct but not vectorized); a branch-free SWAR version
-(4 lane-wise 2-bit-field extractions + spreads, transposed into the 4 per-native-byte output words
-via chained `__byte_perm` pairs, since one `__byte_perm` call only reaches 2 of the 4 field-words)
-cut cycles by ~7.6%. Both promotion versions verified against a bit-by-bit reference exhaustively
-(loop version: all 256 byte values; SWAR version: 200k random 32-bit words against the loop
-version).
-
-| Kernel | Cycles | Duration | Recall |
-|---|---:|---:|---:|
-| Scalar `1+4t` (`single_bit` doc x `transpose_half_byte` query) | 3,874,994 | 1.56 ms | 0.743-0.745 |
-| int4 `1+4`, loop-based promotion | 2,791,889 | 1.11 ms | 0.745-0.746 |
-| int4 `1+4`, SWAR/`__byte_perm` promotion | 2,578,307 | 1.03 ms | 0.745-0.746 |
-
-**~1.5x fewer cycles, ~1.5x faster than the scalar baseline** with the SWAR promotion (up from
-~1.4x with the loop version) -- a much smaller margin than `2x4`'s ~2.4x, and `1x4`'s absolute
-cycle count is *higher* than `2x4`'s despite `single_bit`'s native document footprint being half
-of `packed_dibit`'s. See "Why asymmetric is slower than symmetric" below for the full accounting;
-short version: SMEM-write volume is identical between `1x4` and `2x4` (both promote to the same
-512 B/row nibble-width buffer), so the remaining `1x4` vs `2x4` gap is promotion *compute*, not
-bandwidth -- a 1-bit-to-nibble expansion needs a 4-way byte transpose, a 2-bit-to-nibble expansion
-only a 2-way interleave.
-
-### Comparison against the dense fp16 tensor-core baseline (`local_join_kernel_wmma`)
+## Comparison against the dense fp16 tensor-core baseline (`local_join_kernel_wmma`)
 
 All three int4 kernels also beat the existing dense (unquantized, fp16 `wmma`) local-join kernel
 used for the non-BBQ NN-Descent build, though by a much smaller margin than against the scalar
 BBQ baselines -- expected, since that kernel is already tensor-core-based rather than scalar
-dp4a/popc:
+dp4a/popc. All three figures are post-fusion (end of section 4):
 
 | Kernel | Cycles | Speedup vs `local_join_kernel_wmma` (2,826,551 cycles) |
 |---|---:|---:|
-| Symmetric `4x4` (`packed_nibble`) | 1,933,758 | ~1.46x |
-| Asymmetric `2x4` (`packed_dibit` doc, post-fusion) | 2,215,454 | ~1.28x |
-| Asymmetric `1x4` (`single_bit` doc, SWAR, post-fusion) | 2,291,157 | ~1.23x |
+| Symmetric `4x4` (`packed_nibble`) | 1,833,242 | ~1.54x |
+| Asymmetric `2x4` (`packed_dibit` doc) | 2,215,454 | ~1.28x |
+| Asymmetric `1x4` (`single_bit` doc) | 2,291,157 | ~1.23x |
 
-### Why asymmetric is slower than symmetric (not DRAM bandwidth -- SMEM write volume)
+## Why asymmetric is slower than symmetric (not DRAM bandwidth -- SMEM write volume)
 
 Initial explanation ("asymmetric issues more global-memory reads") turned out to be imprecise --
 worth correcting. Per-row DRAM read volume is actually about *equal* between symmetric and `2x4`
@@ -223,7 +265,8 @@ Per-row-slot byte accounting (dim=1024; `packed_nibble` row=512 B, `packed_dibit
 
 SMEM-write ratio (asymmetric/symmetric) is 2048/1536 = **1.33x** for both `2x4` and `1x4` --
 closely matching the measured cycle ratios (`2x4`/symmetric = 1.29x, `1x4`/symmetric = 1.33x
-exactly). DRAM read volume predicts nothing here (it's equal or even lower for the asymmetric
+exactly, using the section-1 pre-fusion symmetric number the ratio was originally computed
+against). DRAM read volume predicts nothing here (it's equal or even lower for the asymmetric
 kernels), which is why "extra bandwidth" needed this correction: it's SMEM traffic from the
 mandatory full-width promotion plus the loss of phase-1 self-join reuse, not DRAM bandwidth.
 
@@ -232,48 +275,11 @@ ratio: `1x4`'s cycle ratio (1.33x) is fractionally *higher* than `2x4`'s (1.29x)
 reading less from DRAM, consistent with `1x4`'s promotion needing more compute (4-way transpose)
 than `2x4`'s (2-way interleave) for the same SMEM-write volume.
 
-## Original theoretical motivation: SOL analysis (pre-implementation)
-
-Before any of the int4 kernels above existed, this instruction-count model motivated building
-them: `popc = 15 cycles`, `dp4a = 2 cycles`, hypothetical `int8 MMA (m16n8k32) = 4 cycles`,
-applied to the (then-only) scalar `code_inner_product_*_2x1` microkernels. Per-distance
-MAC-instruction cost, `n` = row bytes, `bits` = code bit-width:
-
-| Layout | bits | instr | cycles/distance |
-|---|---:|---|---:|
-| `single_bit` (symmetric) | 1 | popc, `n/4` | 480 |
-| `dibit` (symmetric) | 2 | popc, `bits*(n/4)` | 960 |
-| `transpose_half_byte` (symmetric) | 4 | popc, `bits*(n/4)` | 1920 |
-| `packed_nibble` (symmetric) | 4 | dp4a, `n/8` | 128 |
-| `unsigned_byte` (symmetric) | 8 | dp4a, `n/16` | 64 |
-| 1+2 (asymmetric) | 1+2 | popc, `doc_bits*query_bits*(query_stride/4)` | 480 |
-| 1+4t (asymmetric) | 1+4 | popc, same formula | 480 |
-| 2+4t (asymmetric) | 2+4 | popc, same formula | 960 |
-| int8 tensor core (hypothetical) | 8 | mma, `ceil(K/32)/(16*8)` | 0.125 |
-
-Multi-plane symmetric layouts (`dibit`, `transpose_half_byte`) split the row into `bits` stripes
-and cross every document stripe against every query stripe (`bits^2` sub-calls), so cost scales
-as `bits*(n/4)` -- not free with bit-width. The asymmetric kernel has the same cross-plane
-structure with `doc_bits * query_bits` sub-calls instead of `bits^2`.
-
-**Takeaway at the time:** the encoding, not the bit-width, sets the cost. At equal byte count,
-popc-based layouts cost `15/2 = 7.5x` more per instruction than dp4a-based ones -- 4-bit
-`transpose_half_byte` (1920 cycles/distance) is **15x** more expensive than 4-bit `packed_nibble`
-(128 cycles/distance) at the *same* bit width, purely from the popc-vs-dp4a choice. The
-asymmetric path had no dp4a-based option at the time (no "packed nibble" analogue for either
-operand), so it was stuck paying the popc tax -- exactly the gap `packed_dibit` and `single_bit`'s
-int4 promotion in this branch were built to close. A naive int8/tensor-core promotion looked like
-another large drop in MAC cost on top of that, but was never actually free: caching a full
-int8-promoted row in static shared memory would have pushed several configurations over the
-compile-time static-`__shared__` ceiling common to CUDA GPUs generally (not an L40-specific
-number), forcing the same K-tiled streaming structure the real int4 kernels ended up using anyway
-(`BBQ_ROW_BYTES = 128` in the actual implementation) rather than a single full-row MMA pass.
-
 ## Known follow-ups (not done)
 
 - **`s_ov`-aliasing to remove the separate `s_distances_u32` buffer**, mirroring
   `local_join_kernel_wmma`'s `s_distances`/`s_ov` alias. Valid here for the same reason (register
-  accumulator, one-time store) but gated on register pressure coming down first (see above) --
+  accumulator, one-time store) but gated on register pressure coming down first (see section 1) --
   SMEM and registers are both at the exact same occupancy cap right now, so shrinking only one
   won't change occupancy.
 - Explicit `maxrregcount`/`__launch_bounds__` experiment to find the real register floor.
@@ -296,12 +302,9 @@ number), forcing the same K-tiled streaming structure the real int4 kernels ende
   directly, not assumed -- could mean more iterations needed for the same recall, or lower recall
   at the harness's fixed iteration budget.
 - **Store bank conflicts remain high** even after v1.2's row-padding fix and the `SKEWED_MAX_NUM_BI_SAMPLES`
-  store stride (documented per-kernel above: 1.8-1.9M store conflicts for the asymmetric kernels).
-  Next thing to dig into: `store_matrix_sync`'s own per-thread-to-address mapping for an 8x8 int32
-  (4 B) tile may be the actual source, not just the outer row stride -- v1.3's custom store stride
-  (`MMA_STORE_STRIDE=72`) cut conflicts 4.2x but didn't move cycles, which is itself a clue that
-  store conflicts as currently measured may not be the true bottleneck; worth understanding why
-  before trying another stride value.
-
-See `git log` on this branch for the incremental progression; each stage above was independently
-measured and recall-verified before moving to the next.
+  store stride (documented per-kernel above: 1.6-1.7M store conflicts for the asymmetric kernels
+  post-fusion). Next thing to dig into: `store_matrix_sync`'s own per-thread-to-address mapping
+  for an 8x8 int32 (4 B) tile may be the actual source, not just the outer row stride -- v1.3's
+  custom store stride (`MMA_STORE_STRIDE=72`) cut conflicts 4.2x but didn't move cycles, which is
+  itself a clue that store conflicts as currently measured may not be the true bottleneck; worth
+  understanding why before trying another stride value.
