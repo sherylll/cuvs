@@ -92,6 +92,85 @@ are non-trivial (same root cause as the symmetric kernel's v1.2 finding: `MMA_ST
 SKEWED_MAX_NUM_BI_SAMPLES` isn't bank-friendly) but per that same finding fixing them didn't move
 overall cycles for the symmetric kernel, so it wasn't chased here either.
 
+### 1x4 (`single_bit` document)
+
+Same kernel, templated on `DocumentLayout` (`bbq_layout::packed_dibit` or `bbq_layout::single_bit`)
+so only the promotion function and its native:promoted expansion ratio differ (2x for
+`packed_dibit`, 4x for `single_bit` -- 1 native byte of `single_bit` fully determines 1 promoted
+output word on its own). First cut used a straightforward nested unrolled loop
+(`promote_single_bit_word_to_nibble_quad`, correct but not vectorized); a branch-free SWAR version
+(4 lane-wise 2-bit-field extractions + spreads, transposed into the 4 per-native-byte output words
+via chained `__byte_perm` pairs, since one `__byte_perm` call only reaches 2 of the 4 field-words)
+cut cycles by ~7.6%. Both promotion versions verified against a bit-by-bit reference exhaustively
+(loop version: all 256 byte values; SWAR version: 200k random 32-bit words against the loop
+version).
+
+| Kernel | Cycles | Duration | Recall |
+|---|---:|---:|---:|
+| Scalar `1+4t` (`single_bit` doc x `transpose_half_byte` query) | 3,874,994 | 1.56 ms | 0.743-0.745 |
+| int4 `1+4`, loop-based promotion | 2,791,889 | 1.11 ms | 0.745-0.746 |
+| int4 `1+4`, SWAR/`__byte_perm` promotion | 2,578,307 | 1.03 ms | 0.745-0.746 |
+
+**~1.5x fewer cycles, ~1.5x faster than the scalar baseline** with the SWAR promotion (up from
+~1.4x with the loop version) -- a much smaller margin than `2x4`'s ~2.4x, and `1x4`'s absolute
+cycle count is *higher* than `2x4`'s despite `single_bit`'s native document footprint being half
+of `packed_dibit`'s. See "Why asymmetric is slower than symmetric" below for the full accounting;
+short version: SMEM-write volume is identical between `1x4` and `2x4` (both promote to the same
+512 B/row nibble-width buffer), so the remaining `1x4` vs `2x4` gap is promotion *compute*, not
+bandwidth -- a 1-bit-to-nibble expansion needs a 4-way byte transpose, a 2-bit-to-nibble expansion
+only a 2-way interleave.
+
+### Comparison against the dense fp16 tensor-core baseline (`local_join_kernel_wmma`)
+
+All three int4 kernels also beat the existing dense (unquantized, fp16 `wmma`) local-join kernel
+used for the non-BBQ NN-Descent build, though by a much smaller margin than against the scalar
+BBQ baselines -- expected, since that kernel is already tensor-core-based rather than scalar
+dp4a/popc:
+
+| Kernel | Cycles | Speedup vs `local_join_kernel_wmma` (2,826,551 cycles) |
+|---|---:|---:|
+| Symmetric `4x4` (`packed_nibble`) | 1,933,758 | ~1.46x |
+| Asymmetric `2x4` (`packed_dibit` doc) | 2,485,943 | ~1.14x |
+| Asymmetric `1x4` (`single_bit` doc, SWAR) | 2,578,307 | ~1.10x |
+
+### Why asymmetric is slower than symmetric (not DRAM bandwidth -- SMEM write volume)
+
+Initial explanation ("asymmetric issues more global-memory reads") turned out to be imprecise --
+worth correcting. Per-row DRAM read volume is actually about *equal* between symmetric and `2x4`
+(1536 B either way for dim=1024) and *lower* for `1x4` (1280 B) than for symmetric, since a
+densely-packed document reads fewer native bytes than `packed_nibble`. The real asymmetry is in
+**SMEM write volume**: the document is always promoted to the full 512 B/row nibble-width buffer
+regardless of how compact its native storage is, and -- unlike the symmetric kernel's `new x new`
+phase, which reuses a single 512 B SMEM buffer as both the `a_frag` and `b_frag` source for a
+self-join -- the asymmetric kernel can never skip loading either side, since document and query
+are always two distinct quantized representations of the same rows.
+
+Per-row-slot byte accounting (dim=1024; `packed_nibble` row=512 B, `packed_dibit` row=256 B,
+`single_bit` row=128 B, promoted/SMEM width is always 512 B):
+
+| Kernel | Phase | Buffers (native/DRAM -> promoted/SMEM) | DRAM read | SMEM write |
+|---|---|---|---:|---:|
+| Symmetric `4x4` | `new x new` | `s_nv`: 512B -> 512B (reused as both A and B operand) | 512 B | 512 B |
+| Symmetric `4x4` | `new x old` | `s_nv` (reload): 512B->512B; `s_ov`: 512B->512B | 1024 B | 1024 B |
+| Symmetric `4x4` | **total** | | **1536 B** | **1536 B** |
+| Asymmetric `2x4` | `new x new` | doc: 256B->512B (promoted); query: 512B->512B | 768 B | 1024 B |
+| Asymmetric `2x4` | `new x old` | doc (reload): 256B->512B; query (old): 512B->512B | 768 B | 1024 B |
+| Asymmetric `2x4` | **total** | | **1536 B** | **2048 B** |
+| Asymmetric `1x4` | `new x new` | doc: 128B->512B (promoted); query: 512B->512B | 640 B | 1024 B |
+| Asymmetric `1x4` | `new x old` | doc (reload): 128B->512B; query (old): 512B->512B | 640 B | 1024 B |
+| Asymmetric `1x4` | **total** | | **1280 B** | **2048 B** |
+
+SMEM-write ratio (asymmetric/symmetric) is 2048/1536 = **1.33x** for both `2x4` and `1x4` --
+closely matching the measured cycle ratios (`2x4`/symmetric = 1.29x, `1x4`/symmetric = 1.33x
+exactly). DRAM read volume predicts nothing here (it's equal or even lower for the asymmetric
+kernels), which is why "extra bandwidth" needed this correction: it's SMEM traffic from the
+mandatory full-width promotion plus the loss of phase-1 self-join reuse, not DRAM bandwidth.
+
+This also explains the remaining `1x4` vs `2x4` gap on top of the (identical) 1.33x SMEM-write
+ratio: `1x4`'s cycle ratio (1.33x) is fractionally *higher* than `2x4`'s (1.29x) despite `1x4`
+reading less from DRAM, consistent with `1x4`'s promotion needing more compute (4-way transpose)
+than `2x4`'s (2-way interleave) for the same SMEM-write volume.
+
 ## Known follow-ups (not done)
 
 - **`s_ov`-aliasing to remove the separate `s_distances_u32` buffer**, mirroring

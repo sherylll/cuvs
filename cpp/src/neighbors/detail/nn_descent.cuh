@@ -2058,14 +2058,70 @@ __device__ __forceinline__ void promote_packed_dibit_word_to_nibble_pair(uint32_
   out_hi                   = __byte_perm(spread_tn, spread_bn, 0x7362);  // [TN2,BN2,TN3,BN3]
 }
 
-// int4 tensor-core asymmetric BBQ local join: dense packed_dibit document (bits=2) x
-// packed_nibble query (bits=4). The document is stored on its own natural 2-bit-per-value,
-// 4-values/byte format (half the byte count of packed_nibble) and promoted to packed_nibble's
-// nibble-width layout during SMEM staging (promote_packed_dibit_word_to_nibble_pair above); the
-// query loads with a plain word copy, same as the symmetric int4 kernel. Otherwise structurally
-// identical to local_join_kernel_bbq_symmetric_int4: u4xu4 MMA, register-resident accumulator,
-// one-time store per (row-tile, col-tile). See TENSOR_CORE_NOTES.md.
-template <typename DataT,
+// Promotes one native word of dense single_bit codes (1 bit/value, 8 values/byte, MSB-first:
+// the value at position 8*byte+i sits at bit (7-i)) into four nibble-width, packed_nibble-style
+// output words.
+//
+// Branch-free SWAR: extract the 4 (2-bit) fields of each byte lane-wise across all 4 native
+// bytes at once (field[j]'s byte i = field j of native byte i -- same cross-lane-safe
+// shift+mask trick as promote_packed_dibit_word_to_nibble_pair), spread each field 0-3 into a
+// nibble value lane-wise, then transpose the 4 resulting field-words into the 4 per-native-byte
+// output words with chained __byte_perm pairs (16 bits at a time, since one __byte_perm call
+// only reaches 2 of the 4 field-words). Equivalence with the straightforward
+// per-byte-extraction version verified exhaustively over random 32-bit inputs.
+__device__ __forceinline__ void promote_single_bit_word_to_nibble_quad(uint32_t native_word,
+                                                                       uint32_t out[4])
+{
+  uint32_t spread[4];
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const uint32_t field = (native_word >> (6 - 2 * j)) & 0x03030303u;
+    spread[j]            = ((field & 0x02020202u) << 3) | (field & 0x01010101u);
+  }
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    // sel picks: out byte0 = spread[.]'s byte i (source index i), out byte1 = spread[.]'s byte
+    // i (source index 4+i, i.e. the second byte_perm operand); byte2/3 are don't-care (masked
+    // off below).
+    const uint32_t sel = 0x00000040u + i * 0x00000011u;
+    const uint32_t lo  = __byte_perm(spread[0], spread[1], sel);
+    const uint32_t hi  = __byte_perm(spread[2], spread[3], sel);
+    out[i]             = (lo & 0xFFFFu) | ((hi & 0xFFFFu) << 16);
+  }
+}
+
+// Number of promoted (nibble-width) output words produced per native document word, and the
+// promotion itself -- the only two things that differ between the packed_dibit (2x4) and
+// single_bit (1x4) instantiations of local_join_kernel_bbq_asymmetric_int4 below.
+template <bbq_layout DocumentLayout>
+constexpr int doc_promotion_expansion()
+{
+  static_assert(
+    DocumentLayout == bbq_layout::packed_dibit || DocumentLayout == bbq_layout::single_bit,
+    "local_join_kernel_bbq_asymmetric_int4 only supports packed_dibit or single_bit "
+    "documents");
+  return DocumentLayout == bbq_layout::packed_dibit ? 2 : 4;
+}
+
+template <bbq_layout DocumentLayout>
+__device__ __forceinline__ void promote_doc_word(uint32_t native_word, uint32_t* out)
+{
+  if constexpr (DocumentLayout == bbq_layout::packed_dibit) {
+    promote_packed_dibit_word_to_nibble_pair(native_word, out[0], out[1]);
+  } else {
+    promote_single_bit_word_to_nibble_quad(native_word, out);
+  }
+}
+
+// int4 tensor-core asymmetric BBQ local join: a densely-packed document (packed_dibit, bits=2,
+// or single_bit, bits=1) against a packed_nibble query (bits=4). The document is stored on its
+// own natural on-disk format and promoted to packed_nibble's nibble-width layout during SMEM
+// staging (promote_doc_word<DocumentLayout> above); the query loads with a plain word copy,
+// same as the symmetric int4 kernel. Otherwise structurally identical to
+// local_join_kernel_bbq_symmetric_int4: u4xu4 MMA, register-resident accumulator, one-time
+// store per (row-tile, col-tile). See TENSOR_CORE_NOTES.md.
+template <bbq_layout DocumentLayout,
+          typename DataT,
           typename Index_t,
           typename ID_t = InternalID_t<Index_t>,
           typename DistEpilogue_t>
@@ -2170,16 +2226,17 @@ __launch_bounds__(BLOCK_SIZE)
   const int lane_id       = threadIdx.x % raft::warp_size();
   constexpr int num_warps = BLOCK_SIZE / raft::warp_size();
   // plane_bytes/n_tiles are driven by the query's (packed_nibble) row length, which sets the
-  // promoted staging tile. The document's (packed_dibit) row length is exactly half that
-  // (dim % 32 == 0 guarantees no rounding), so native_tile below covers the same dim range per
-  // tile once each native byte is promoted to 2 nibble-width bytes -- n_tiles applies to both.
+  // promoted staging tile. The document's row length is exactly plane_tile/expansion (dim % 32
+  // == 0 guarantees no rounding), so native_tile below covers the same dim range per tile once
+  // each native word is promoted to `expansion` nibble-width words -- n_tiles applies to both.
   const size_t plane_bytes =
     cuvs::preprocessing::quantize::bbq::get_encoded_row_length(dataset_query);
   const size_t doc_plane_bytes =
     cuvs::preprocessing::quantize::bbq::get_encoded_row_length(dataset_document);
   constexpr int plane_tile      = BBQ_ROW_BYTES;
   constexpr int plane_tile_u32  = plane_tile / 4;
-  constexpr int native_tile     = BBQ_ROW_BYTES / 2;
+  constexpr int expansion       = doc_promotion_expansion<DocumentLayout>();
+  constexpr int native_tile     = BBQ_ROW_BYTES / expansion;
   constexpr int native_tile_u32 = native_tile / 4;
   const int n_tiles             = raft::ceildiv(static_cast<int>(plane_bytes), plane_tile);
 
@@ -2214,16 +2271,20 @@ __launch_bounds__(BLOCK_SIZE)
           const uint32_t* dsrc = reinterpret_cast<const uint32_t*>(
             &dataset_document.codes(new_neighbors[idx], native_base));
           for (int w = lane_id; w < native_num_load_u32; w += raft::warp_size()) {
-            uint32_t out_lo, out_hi;
-            promote_packed_dibit_word_to_nibble_pair(dsrc[w], out_lo, out_hi);
-            s_doc_u32[2 * w]     = out_lo;
-            s_doc_u32[2 * w + 1] = out_hi;
+            uint32_t out[expansion];
+            promote_doc_word<DocumentLayout>(dsrc[w], out);
+#pragma unroll
+            for (int e = 0; e < expansion; ++e) {
+              s_doc_u32[expansion * w + e] = out[e];
+            }
           }
           if (last_tile) {
             for (int w = native_num_load_u32 + lane_id; w < native_tile_u32;
                  w += raft::warp_size()) {
-              s_doc_u32[2 * w]     = 0;
-              s_doc_u32[2 * w + 1] = 0;
+#pragma unroll
+              for (int e = 0; e < expansion; ++e) {
+                s_doc_u32[expansion * w + e] = 0;
+              }
             }
           }
           auto* s_q_u32 = reinterpret_cast<uint32_t*>(s_query_vec[idx]);
@@ -2347,16 +2408,20 @@ __launch_bounds__(BLOCK_SIZE)
           const uint32_t* dsrc = reinterpret_cast<const uint32_t*>(
             &dataset_document.codes(new_neighbors[idx], native_base));
           for (int w = lane_id; w < native_num_load_u32; w += raft::warp_size()) {
-            uint32_t out_lo, out_hi;
-            promote_packed_dibit_word_to_nibble_pair(dsrc[w], out_lo, out_hi);
-            s_doc_u32[2 * w]     = out_lo;
-            s_doc_u32[2 * w + 1] = out_hi;
+            uint32_t out[expansion];
+            promote_doc_word<DocumentLayout>(dsrc[w], out);
+#pragma unroll
+            for (int e = 0; e < expansion; ++e) {
+              s_doc_u32[expansion * w + e] = out[e];
+            }
           }
           if (last_tile) {
             for (int w = native_num_load_u32 + lane_id; w < native_tile_u32;
                  w += raft::warp_size()) {
-              s_doc_u32[2 * w]     = 0;
-              s_doc_u32[2 * w + 1] = 0;
+#pragma unroll
+              for (int e = 0; e < expansion; ++e) {
+                s_doc_u32[expansion * w + e] = 0;
+              }
             }
           }
         }
@@ -3128,17 +3193,18 @@ void GNND<Data_t, Index_t>::local_join(cudaStream_t stream,
   const bool has_transpose_half_byte =
     dataset.has_bit_and_layout(4, bbq_layout::transpose_half_byte);
   const bool has_packed_nibble = dataset.has_bit_and_layout(4, bbq_layout::packed_nibble);
-  // nnd-bbq-tc: int4 tensor-core asymmetric path uses packed_dibit at bits=2 for the document --
-  // a dense, 4-values/byte on-disk format (half the bytes of storing 2-bit codes in
-  // packed_nibble's nibble-width slots) that gets promoted to nibble width during SMEM staging
-  // in local_join_kernel_bbq_asymmetric_int4. dibit's bit-plane layout can't be reused here --
+  // nnd-bbq-tc: int4 tensor-core asymmetric path uses packed_dibit at bits=2 (document, 2x4) or
+  // single_bit at bits=1 (document, 1x4) paired with a packed_nibble query -- both document
+  // layouts are dense on-disk formats promoted to nibble width during SMEM staging in
+  // local_join_kernel_bbq_asymmetric_int4. dibit's bit-plane layout can't be reused for this --
   // its scalar decode algorithm genuinely depends on the bit-plane structure. See
   // TENSOR_CORE_NOTES.md.
   const bool has_packed_dibit = dataset.has_bit_and_layout(2, bbq_layout::packed_dibit);
   bool use_asymmetric = false;
   if (dataset.quantizers.size() > 1) {
     if ((has_single_bit && has_dibit) || (has_single_bit && has_transpose_half_byte) ||
-        (has_dibit && has_transpose_half_byte) || (has_packed_dibit && has_packed_nibble)) {
+        (has_dibit && has_transpose_half_byte) || (has_packed_dibit && has_packed_nibble) ||
+        (has_single_bit && has_packed_nibble)) {
       use_asymmetric = true;
     }
   }
@@ -3203,15 +3269,22 @@ void GNND<Data_t, Index_t>::local_join(cudaStream_t stream,
                quantizer_query.layout == bbq_layout::transpose_half_byte) {
       launch_asymmetric(std::integral_constant<bbq_layout, bbq_layout::dibit>{},
                         std::integral_constant<bbq_layout, bbq_layout::transpose_half_byte>{});
-    } else if (quantizer_document.layout == bbq_layout::packed_dibit &&
+    } else if ((quantizer_document.layout == bbq_layout::packed_dibit ||
+                quantizer_document.layout == bbq_layout::single_bit) &&
                quantizer_query.layout == bbq_layout::packed_nibble) {
-      // int4 tensor-core asymmetric path: dense packed_dibit at bits=2 (document) promoted to
-      // packed_nibble's nibble-width layout at bits=4 (query) during SMEM staging. See
-      // TENSOR_CORE_NOTES.md.
-      RAFT_EXPECTS(quantizer_document.bits == 2 && quantizer_query.bits == 4,
-                   "int4 asymmetric packed_dibit/packed_nibble pair must be bits=2 (document) x "
-                   "bits=4 (query), got document bits=%d, query bits=%d",
-                   static_cast<int>(quantizer_document.bits),
+      // int4 tensor-core asymmetric path: a densely-packed document (packed_dibit at bits=2, or
+      // single_bit at bits=1) promoted to packed_nibble's nibble-width layout at bits=4 (query)
+      // during SMEM staging. See TENSOR_CORE_NOTES.md.
+      const bool document_is_packed_dibit = quantizer_document.layout == bbq_layout::packed_dibit;
+      RAFT_EXPECTS(
+        (document_is_packed_dibit && quantizer_document.bits == 2) ||
+          (!document_is_packed_dibit && quantizer_document.bits == 1),
+        "int4 asymmetric document must be packed_dibit at bits=2 or single_bit at bits=1, got "
+        "layout=%s bits=%d",
+        document_is_packed_dibit ? "packed_dibit" : "single_bit",
+        static_cast<int>(quantizer_document.bits));
+      RAFT_EXPECTS(quantizer_query.bits == 4,
+                   "int4 asymmetric path requires a packed_nibble query at bits=4, got bits=%d",
                    static_cast<int>(quantizer_query.bits));
       auto proxy_kernel = compute_l2_norms_kernel<float>;
       auto runtime_arch =
@@ -3222,24 +3295,32 @@ void GNND<Data_t, Index_t>::local_join(cudaStream_t stream,
                    "local_join_kernel_bbq_asymmetric_int4 requires int4 tensor-core MMA support "
                    "(compute capability >= 7.5 and < 10.0 / Blackwell); current runtime "
                    "architecture is unsupported.");
-      local_join_kernel_bbq_asymmetric_int4<<<nrow_, BLOCK_SIZE, 0, stream>>>(
-        graph_.h_graph_new.data_handle(),
-        h_rev_graph_new_.data_handle(),
-        d_list_sizes_new_.data_handle(),
-        h_graph_old_.data_handle(),
-        h_rev_graph_old_.data_handle(),
-        d_list_sizes_old_.data_handle(),
-        NUM_SAMPLES,
-        quantizer_query,
-        quantizer_document,
-        graph_buffer_.data_handle(),
-        dists_buffer_.data_handle(),
-        DEGREE_ON_DEVICE,
-        d_locks_.data_handle(),
-        l2_norms_document_ptr,
-        l2_norms_query_ptr,
-        build_config_.metric,
-        dist_epilogue);
+      auto launch_asymmetric_int4 = [&](auto document_layout) {
+        constexpr auto DocumentLayout = decltype(document_layout)::value;
+        local_join_kernel_bbq_asymmetric_int4<DocumentLayout>
+          <<<nrow_, BLOCK_SIZE, 0, stream>>>(graph_.h_graph_new.data_handle(),
+                                             h_rev_graph_new_.data_handle(),
+                                             d_list_sizes_new_.data_handle(),
+                                             h_graph_old_.data_handle(),
+                                             h_rev_graph_old_.data_handle(),
+                                             d_list_sizes_old_.data_handle(),
+                                             NUM_SAMPLES,
+                                             quantizer_query,
+                                             quantizer_document,
+                                             graph_buffer_.data_handle(),
+                                             dists_buffer_.data_handle(),
+                                             DEGREE_ON_DEVICE,
+                                             d_locks_.data_handle(),
+                                             l2_norms_document_ptr,
+                                             l2_norms_query_ptr,
+                                             build_config_.metric,
+                                             dist_epilogue);
+      };
+      if (document_is_packed_dibit) {
+        launch_asymmetric_int4(std::integral_constant<bbq_layout, bbq_layout::packed_dibit>{});
+      } else {
+        launch_asymmetric_int4(std::integral_constant<bbq_layout, bbq_layout::single_bit>{});
+      }
     } else {
       RAFT_FAIL("Unsupported BBQ layout pair for asymmetric local join.");
     }
