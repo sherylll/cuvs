@@ -171,6 +171,43 @@ ratio: `1x4`'s cycle ratio (1.33x) is fractionally *higher* than `2x4`'s (1.29x)
 reading less from DRAM, consistent with `1x4`'s promotion needing more compute (4-way transpose)
 than `2x4`'s (2-way interleave) for the same SMEM-write volume.
 
+## Original theoretical motivation: SOL analysis (pre-implementation)
+
+Before any of the int4 kernels above existed, this instruction-count model motivated building
+them: `popc = 15 cycles`, `dp4a = 2 cycles`, hypothetical `int8 MMA (m16n8k32) = 4 cycles`,
+applied to the (then-only) scalar `code_inner_product_*_2x1` microkernels. Per-distance
+MAC-instruction cost, `n` = row bytes, `bits` = code bit-width:
+
+| Layout | bits | instr | cycles/distance |
+|---|---:|---|---:|
+| `single_bit` (symmetric) | 1 | popc, `n/4` | 480 |
+| `dibit` (symmetric) | 2 | popc, `bits*(n/4)` | 960 |
+| `transpose_half_byte` (symmetric) | 4 | popc, `bits*(n/4)` | 1920 |
+| `packed_nibble` (symmetric) | 4 | dp4a, `n/8` | 128 |
+| `unsigned_byte` (symmetric) | 8 | dp4a, `n/16` | 64 |
+| 1+2 (asymmetric) | 1+2 | popc, `doc_bits*query_bits*(query_stride/4)` | 480 |
+| 1+4t (asymmetric) | 1+4 | popc, same formula | 480 |
+| 2+4t (asymmetric) | 2+4 | popc, same formula | 960 |
+| int8 tensor core (hypothetical) | 8 | mma, `ceil(K/32)/(16*8)` | 0.125 |
+
+Multi-plane symmetric layouts (`dibit`, `transpose_half_byte`) split the row into `bits` stripes
+and cross every document stripe against every query stripe (`bits^2` sub-calls), so cost scales
+as `bits*(n/4)` -- not free with bit-width. The asymmetric kernel has the same cross-plane
+structure with `doc_bits * query_bits` sub-calls instead of `bits^2`.
+
+**Takeaway at the time:** the encoding, not the bit-width, sets the cost. At equal byte count,
+popc-based layouts cost `15/2 = 7.5x` more per instruction than dp4a-based ones -- 4-bit
+`transpose_half_byte` (1920 cycles/distance) is **15x** more expensive than 4-bit `packed_nibble`
+(128 cycles/distance) at the *same* bit width, purely from the popc-vs-dp4a choice. The
+asymmetric path had no dp4a-based option at the time (no "packed nibble" analogue for either
+operand), so it was stuck paying the popc tax -- exactly the gap `packed_dibit` and `single_bit`'s
+int4 promotion in this branch were built to close. A naive int8/tensor-core promotion looked like
+another large drop in MAC cost on top of that, but was never actually free: caching a full
+int8-promoted row in static shared memory would have pushed several configurations over the
+compile-time static-`__shared__` ceiling common to CUDA GPUs generally (not an L40-specific
+number), forcing the same K-tiled streaming structure the real int4 kernels ended up using anyway
+(`BBQ_ROW_BYTES = 128` in the actual implementation) rather than a single full-row MMA pass.
+
 ## Known follow-ups (not done)
 
 - **`s_ov`-aliasing to remove the separate `s_distances_u32` buffer**, mirroring
