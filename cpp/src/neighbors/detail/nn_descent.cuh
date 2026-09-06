@@ -2504,215 +2504,134 @@ void GNND<Data_t, Index_t>::local_join(cudaStream_t stream,
                                        DistEpilogue_t dist_epilogue)
 {
   namespace bbq = cuvs::preprocessing::quantize::bbq;
+  using L       = bbq_layout;
   raft::matrix::fill(res, dists_buffer_.view(), std::numeric_limits<float>::max());
-  const bool has_1b = dataset.has_bit_and_layout(1, bbq_layout::packed_1b);
-  const bool has_4b = dataset.has_bit_and_layout(4, bbq_layout::packed_4b);
-  // int4 tensor-core asymmetric path: a packed_2b or packed_1b document promoted to 4-bit width
-  // against a packed_4b query.
-  const bool has_2b  = dataset.has_bit_and_layout(2, bbq_layout::packed_2b);
-  const bool has_2bt = dataset.has_bit_and_layout(2, bbq_layout::transposed_2b);
-  const bool has_4bt = dataset.has_bit_and_layout(4, bbq_layout::transposed_4b);
-  // Any dataset with >1 quantizer was explicitly asked to do asymmetric local join -- treat it
-  // as asymmetric unconditionally (not just when it happens to match the one supported pair)
-  // so an unsupported pair fails loudly (RAFT_FAIL below) instead of silently falling through
-  // to the symmetric branch and discarding the second quantizer.
-  const bool use_asymmetric = dataset.quantizers.size() > 1;
-  if (use_asymmetric) {
-    // Two asymmetric families, distinguished by the query's layout family:
-    //   packed query (packed_4b)      -> int4 tensor-core kernel, document promoted to 4-bit
-    //   transposed query (2t / 4t)    -> SIMT popc kernel over bit planes
-    const bool tc_pair   = has_4b && (has_2b || has_1b);
-    const bool simt_pair = (has_4bt && (has_1b || has_2bt)) || (has_2bt && has_1b);
-    RAFT_EXPECTS(tc_pair || simt_pair,
-                 "Unsupported BBQ layout pair for asymmetric local join. Supported: "
-                 "packed_2b/packed_1b document x packed_4b query (tensor core); "
-                 "packed_1b x transposed_2b, packed_1b x transposed_4b, "
-                 "transposed_2b x transposed_4b (SIMT).");
-    auto quantizer_query    = tc_pair
-                                ? dataset.get_quantizer(4, bbq_layout::packed_4b)
-                                : (has_4bt ? dataset.get_quantizer(4, bbq_layout::transposed_4b)
-                                           : dataset.get_quantizer(2, bbq_layout::transposed_2b));
-    auto quantizer_document = tc_pair
-                                ? (has_1b ? dataset.get_quantizer(1, bbq_layout::packed_1b)
-                                          : dataset.get_quantizer(2, bbq_layout::packed_2b))
-                                : (has_1b ? dataset.get_quantizer(1, bbq_layout::packed_1b)
-                                          : dataset.get_quantizer(2, bbq_layout::transposed_2b));
-    // load_vec_bbq_simt casts code buffers to uint32_t*, so each plane stride (= ceildiv(dim,8))
-    // must be a multiple of 4, i.e. the dataset dim must be a multiple of 32.
-    RAFT_EXPECTS(quantizer_document.dim() % 32 == 0,
-                 "Asymmetric BBQ local join requires dataset dim to be a multiple of 32 for "
-                 "32-bit aligned plane loads, got dim = %lld",
-                 static_cast<long long>(quantizer_document.dim()));
-    if (tc_pair) {
-      RAFT_EXPECTS(
-        (has_2b && quantizer_document.bits == 2) || (has_1b && quantizer_document.bits == 1),
-        "int4 asymmetric document must be packed_2b at bits=2 or packed_1b at bits=1, got "
-        "bits=%d",
-        static_cast<int>(quantizer_document.bits));
-      RAFT_EXPECTS(quantizer_query.bits == 4,
-                   "int4 asymmetric path requires a packed_4b query at bits=4, got bits=%d",
-                   static_cast<int>(quantizer_query.bits));
-    }
 
-    auto l2_norms_query               = std::optional<raft::device_vector<DistData_t, size_t>>();
-    DistData_t* l2_norms_query_ptr    = nullptr;
-    DistData_t* l2_norms_document_ptr = nullptr;
-    if (build_config_.metric == cuvs::distance::DistanceType::CosineExpanded) {
-      l2_norms_query = std::make_optional(raft::make_device_vector<DistData_t, size_t>(res, nrow_));
-      l2_norms_query_ptr    = l2_norms_query.value().data_handle();
-      l2_norms_document_ptr = l2_norms_.data_handle();
-      raft::linalg::map_offset(res, l2_norms_.view(), bbq::bbq_row_norm_op{quantizer_document});
+  // Both kernels take the same (document, query) pair, so there is no symmetric/asymmetric split
+  // here: a single quantizer just means the same one on both operands, which is exactly what
+  // SelfJoin encodes. Picking the two quantizers is all that differs.
+  const bool self_join = dataset.quantizers.size() == 1;
+  const bool has_1b    = dataset.has_bit_and_layout(1, L::packed_1b);
+  const bool has_2b    = dataset.has_bit_and_layout(2, L::packed_2b);
+  const bool has_4b    = dataset.has_bit_and_layout(4, L::packed_4b);
+  const bool has_2bt   = dataset.has_bit_and_layout(2, L::transposed_2b);
+  const bool has_4bt   = dataset.has_bit_and_layout(4, L::transposed_4b);
+
+  // Asymmetric: a packed_4b query selects the tensor-core path, a transposed query the SIMT one.
+  const bool tc_pair   = has_4b && (has_2b || has_1b);
+  const bool simt_pair = (has_4bt && (has_1b || has_2bt)) || (has_2bt && has_1b);
+  RAFT_EXPECTS(self_join || tc_pair || simt_pair,
+               "Unsupported BBQ layout pair for asymmetric local join. Supported: "
+               "packed_2b/packed_1b x packed_4b (tensor core); packed_1b x transposed_2b, "
+               "packed_1b x transposed_4b, transposed_2b x transposed_4b (SIMT).");
+  auto quantizer_query    = self_join
+                              ? dataset.quantizers[0]
+                              : (tc_pair ? dataset.get_quantizer(4, L::packed_4b)
+                                         : (has_4bt ? dataset.get_quantizer(4, L::transposed_4b)
+                                                    : dataset.get_quantizer(2, L::transposed_2b)));
+  auto quantizer_document = self_join
+                              ? dataset.quantizers[0]
+                              : (has_1b ? dataset.get_quantizer(1, L::packed_1b)
+                                        : (tc_pair ? dataset.get_quantizer(2, L::packed_2b)
+                                                   : dataset.get_quantizer(2, L::transposed_2b)));
+
+  // load_vec_bbq_simt / stage_promoted_tile cast code buffers to uint32_t*, so every plane stride
+  // must be 4-byte aligned.
+  {
+    const auto len     = bbq::get_encoded_row_length(quantizer_query);
+    const int n_planes = quantizer_query.layout == L::transposed_2b   ? 2
+                         : quantizer_query.layout == L::transposed_4b ? 4
+                                                                      : 1;
+    RAFT_EXPECTS(len % (4u * static_cast<uint32_t>(n_planes)) == 0,
+                 "BBQ local join requires the encoded row length to be a multiple of 4*n_planes "
+                 "for 32-bit aligned plane loads, got %u with n_planes = %d",
+                 len,
+                 n_planes);
+    RAFT_EXPECTS(quantizer_document.dim() % 32 == 0,
+                 "BBQ local join requires dataset dim to be a multiple of 32, got %lld",
+                 static_cast<long long>(quantizer_document.dim()));
+  }
+
+  auto l2_norms_query_owned         = std::optional<raft::device_vector<DistData_t, size_t>>();
+  DistData_t* l2_norms_document_ptr = l2_norms_.data_handle();
+  DistData_t* l2_norms_query_ptr    = l2_norms_.data_handle();
+  if (build_config_.metric == cuvs::distance::DistanceType::CosineExpanded) {
+    raft::linalg::map_offset(res, l2_norms_.view(), bbq::bbq_row_norm_op{quantizer_document});
+    if (!self_join) {
+      l2_norms_query_owned =
+        std::make_optional(raft::make_device_vector<DistData_t, size_t>(res, nrow_));
+      l2_norms_query_ptr = l2_norms_query_owned.value().data_handle();
       raft::linalg::map_offset(
-        res, l2_norms_query.value().view(), bbq::bbq_row_norm_op{quantizer_query});
-    }
-    auto launch_asymmetric_int4 = [&](auto document_layout) {
-      constexpr auto DocumentLayout = decltype(document_layout)::value;
-      // Query side is packed_4b today (promotion is the identity there); it is a template
-      // parameter so a promoted query (1+2, 2+2) is a dispatch change, not a kernel change.
-      local_join_kernel_bbq_wmma<DocumentLayout, bbq_layout::packed_4b, /*SelfJoin=*/false>
-        <<<nrow_, BLOCK_SIZE, 0, stream>>>(graph_.h_graph_new.data_handle(),
-                                           h_rev_graph_new_.data_handle(),
-                                           d_list_sizes_new_.data_handle(),
-                                           h_graph_old_.data_handle(),
-                                           h_rev_graph_old_.data_handle(),
-                                           d_list_sizes_old_.data_handle(),
-                                           NUM_SAMPLES,
-                                           quantizer_document,
-                                           quantizer_query,
-                                           graph_buffer_.data_handle(),
-                                           dists_buffer_.data_handle(),
-                                           DEGREE_ON_DEVICE,
-                                           d_locks_.data_handle(),
-                                           l2_norms_document_ptr,
-                                           l2_norms_query_ptr,
-                                           build_config_.metric,
-                                           dist_epilogue);
-    };
-    auto launch_asymmetric_simt = [&](auto document_layout, auto query_layout) {
-      constexpr auto DocumentLayout = decltype(document_layout)::value;
-      constexpr auto QueryLayout    = decltype(query_layout)::value;
-      local_join_kernel_bbq_simt<DocumentLayout, QueryLayout, /*SelfJoin=*/false>
-        <<<nrow_, BLOCK_SIZE, 0, stream>>>(graph_.h_graph_new.data_handle(),
-                                           h_rev_graph_new_.data_handle(),
-                                           d_list_sizes_new_.data_handle(),
-                                           h_graph_old_.data_handle(),
-                                           h_rev_graph_old_.data_handle(),
-                                           d_list_sizes_old_.data_handle(),
-                                           NUM_SAMPLES,
-                                           quantizer_document,
-                                           quantizer_query,
-                                           graph_buffer_.data_handle(),
-                                           dists_buffer_.data_handle(),
-                                           DEGREE_ON_DEVICE,
-                                           d_locks_.data_handle(),
-                                           l2_norms_document_ptr,
-                                           l2_norms_query_ptr,
-                                           build_config_.metric,
-                                           dist_epilogue);
-    };
-    using L = bbq_layout;
-    if (tc_pair) {
-      if (has_1b) {
-        launch_asymmetric_int4(std::integral_constant<L, L::packed_1b>{});
-      } else {
-        launch_asymmetric_int4(std::integral_constant<L, L::packed_2b>{});
-      }
-    } else if (quantizer_document.layout == L::packed_1b &&
-               quantizer_query.layout == L::transposed_2b) {
-      launch_asymmetric_simt(std::integral_constant<L, L::packed_1b>{},
-                             std::integral_constant<L, L::transposed_2b>{});
-    } else if (quantizer_document.layout == L::packed_1b &&
-               quantizer_query.layout == L::transposed_4b) {
-      launch_asymmetric_simt(std::integral_constant<L, L::packed_1b>{},
-                             std::integral_constant<L, L::transposed_4b>{});
-    } else if (quantizer_document.layout == L::transposed_2b &&
-               quantizer_query.layout == L::transposed_4b) {
-      launch_asymmetric_simt(std::integral_constant<L, L::transposed_2b>{},
-                             std::integral_constant<L, L::transposed_4b>{});
-    } else {
-      RAFT_FAIL("Unsupported BBQ layout pair for asymmetric local join.");
-    }
-  } else {
-    auto quantizer = dataset.quantizers[0];
-    // load_vec_bbq_simt casts code buffers to uint32_t*, so each plane stride
-    // (= encoded_row_length / n_planes) must be a multiple of 4, i.e. the encoded row length
-    // must be a multiple of 4 * n_planes.
-    {
-      const auto encoded_row_length = bbq::get_encoded_row_length(quantizer);
-      const int n_planes            = quantizer.layout == bbq_layout::transposed_2b   ? 2
-                                      : quantizer.layout == bbq_layout::transposed_4b ? 4
-                                                                                      : 1;
-      RAFT_EXPECTS(encoded_row_length % (4u * static_cast<uint32_t>(n_planes)) == 0,
-                   "Symmetric BBQ local join requires encoded row length to be a multiple of "
-                   "4*n_planes for 32-bit aligned plane loads, got encoded_row_length = %u, "
-                   "n_planes = %d",
-                   encoded_row_length,
-                   n_planes);
-    }
-    if (build_config_.metric == cuvs::distance::DistanceType::CosineExpanded) {
-      raft::linalg::map_offset(res, l2_norms_.view(), bbq::bbq_row_norm_op{quantizer});
-    }
-    // packed_4b goes through the int4 tensor-core path; packed_1b/transposed_2b stay on the SIMT
-    // path as reference points. transposed_4b/packed_7b/packed_8b are not dispatched.
-    auto launch_symmetric = [&](auto layout) {
-      constexpr auto Layout = decltype(layout)::value;
-      // Symmetric = the same quantizer on both operands: pass it (and l2_norms) twice and set
-      // SelfJoin so phase 1 skips the redundant staging and aliases the buffer.
-      local_join_kernel_bbq_simt<Layout, Layout, /*SelfJoin=*/true>
-        <<<nrow_, BLOCK_SIZE, 0, stream>>>(graph_.h_graph_new.data_handle(),
-                                           h_rev_graph_new_.data_handle(),
-                                           d_list_sizes_new_.data_handle(),
-                                           h_graph_old_.data_handle(),
-                                           h_rev_graph_old_.data_handle(),
-                                           d_list_sizes_old_.data_handle(),
-                                           NUM_SAMPLES,
-                                           quantizer,
-                                           quantizer,
-                                           graph_buffer_.data_handle(),
-                                           dists_buffer_.data_handle(),
-                                           DEGREE_ON_DEVICE,
-                                           d_locks_.data_handle(),
-                                           l2_norms_.data_handle(),
-                                           l2_norms_.data_handle(),
-                                           build_config_.metric,
-                                           dist_epilogue);
-    };
-    switch (quantizer.layout) {
-      case bbq_layout::packed_1b:
-        launch_symmetric(std::integral_constant<bbq_layout, bbq_layout::packed_1b>{});
-        break;
-      case bbq_layout::transposed_2b:
-        launch_symmetric(std::integral_constant<bbq_layout, bbq_layout::transposed_2b>{});
-        break;
-      case bbq_layout::packed_4b: {
-        // Symmetric = the same quantizer on both operands, so it passes `quantizer`/`l2_norms`
-        // twice and enables the phase-1 self-join buffer alias.
-        local_join_kernel_bbq_wmma<bbq_layout::packed_4b,
-                                   bbq_layout::packed_4b,
-                                   /*SelfJoin=*/true>
-          <<<nrow_, BLOCK_SIZE, 0, stream>>>(graph_.h_graph_new.data_handle(),
-                                             h_rev_graph_new_.data_handle(),
-                                             d_list_sizes_new_.data_handle(),
-                                             h_graph_old_.data_handle(),
-                                             h_rev_graph_old_.data_handle(),
-                                             d_list_sizes_old_.data_handle(),
-                                             NUM_SAMPLES,
-                                             quantizer,
-                                             quantizer,
-                                             graph_buffer_.data_handle(),
-                                             dists_buffer_.data_handle(),
-                                             DEGREE_ON_DEVICE,
-                                             d_locks_.data_handle(),
-                                             l2_norms_.data_handle(),
-                                             l2_norms_.data_handle(),
-                                             build_config_.metric,
-                                             dist_epilogue);
-        break;
-      }
-      default: RAFT_FAIL("Unsupported BBQ layout for symmetric local join on this branch.");
+        res, l2_norms_query_owned.value().view(), bbq::bbq_row_norm_op{quantizer_query});
     }
   }
-  RAFT_CUDA_TRY(cudaPeekAtLastError());
+
+  // One launch site for both kernels: they take identical arguments, and the query's layout picks
+  // the path -- packed_4b is the only layout the int4 tensor-core kernel is dispatched for.
+  auto launch = [&](auto document_layout, auto query_layout, auto self_join_tag) {
+    constexpr auto D = decltype(document_layout)::value;
+    constexpr auto Q = decltype(query_layout)::value;
+    constexpr bool S = decltype(self_join_tag)::value;
+#define CUVS_BBQ_LOCAL_JOIN_ARGS                                                                 \
+  graph_.h_graph_new.data_handle(), h_rev_graph_new_.data_handle(),                              \
+    d_list_sizes_new_.data_handle(), h_graph_old_.data_handle(), h_rev_graph_old_.data_handle(), \
+    d_list_sizes_old_.data_handle(), NUM_SAMPLES, quantizer_document, quantizer_query,           \
+    graph_buffer_.data_handle(), dists_buffer_.data_handle(), DEGREE_ON_DEVICE,                  \
+    d_locks_.data_handle(), l2_norms_document_ptr, l2_norms_query_ptr, build_config_.metric,     \
+    dist_epilogue
+    if constexpr (Q == L::packed_4b) {
+      local_join_kernel_bbq_wmma<D, Q, S>
+        <<<nrow_, BLOCK_SIZE, 0, stream>>>(CUVS_BBQ_LOCAL_JOIN_ARGS);
+    } else {
+      local_join_kernel_bbq_simt<D, Q, S>
+        <<<nrow_, BLOCK_SIZE, 0, stream>>>(CUVS_BBQ_LOCAL_JOIN_ARGS);
+    }
+#undef CUVS_BBQ_LOCAL_JOIN_ARGS
+  };
+  const L d = quantizer_document.layout;
+  const L q = quantizer_query.layout;
+  if (self_join) {
+    switch (d) {
+      case L::packed_1b:
+        launch(std::integral_constant<L, L::packed_1b>{},
+               std::integral_constant<L, L::packed_1b>{},
+               std::true_type{});
+        break;
+      case L::transposed_2b:
+        launch(std::integral_constant<L, L::transposed_2b>{},
+               std::integral_constant<L, L::transposed_2b>{},
+               std::true_type{});
+        break;
+      case L::packed_4b:
+        launch(std::integral_constant<L, L::packed_4b>{},
+               std::integral_constant<L, L::packed_4b>{},
+               std::true_type{});
+        break;
+      default: RAFT_FAIL("Unsupported BBQ layout for symmetric local join on this branch.");
+    }
+  } else if (d == L::packed_1b && q == L::packed_4b) {
+    launch(std::integral_constant<L, L::packed_1b>{},
+           std::integral_constant<L, L::packed_4b>{},
+           std::false_type{});
+  } else if (d == L::packed_2b && q == L::packed_4b) {
+    launch(std::integral_constant<L, L::packed_2b>{},
+           std::integral_constant<L, L::packed_4b>{},
+           std::false_type{});
+  } else if (d == L::packed_1b && q == L::transposed_2b) {
+    launch(std::integral_constant<L, L::packed_1b>{},
+           std::integral_constant<L, L::transposed_2b>{},
+           std::false_type{});
+  } else if (d == L::packed_1b && q == L::transposed_4b) {
+    launch(std::integral_constant<L, L::packed_1b>{},
+           std::integral_constant<L, L::transposed_4b>{},
+           std::false_type{});
+  } else if (d == L::transposed_2b && q == L::transposed_4b) {
+    launch(std::integral_constant<L, L::transposed_2b>{},
+           std::integral_constant<L, L::transposed_4b>{},
+           std::false_type{});
+  } else {
+    RAFT_FAIL("Unsupported BBQ layout pair for asymmetric local join.");
+  }
 }
 
 template <typename Data_t, typename Index_t>
