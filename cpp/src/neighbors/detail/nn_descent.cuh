@@ -924,7 +924,7 @@ __launch_bounds__(BLOCK_SIZE)
 // (id, neighbs[idx]) is the document vs. the query flips with it too (moot when document ==
 // query, i.e. the symmetric case).
 template <typename DataT, typename Index_t, typename DistEpilogue_t>
-__device__ ResultItem<Index_t> get_min_item_fused(
+__device__ __forceinline__ ResultItem<Index_t> get_min_item_fused(
   const Index_t id,
   const int idx_in_list,
   const Index_t* neighbs,
@@ -1000,365 +1000,102 @@ __device__ ResultItem<Index_t> get_min_item_fused(
   return result;
 }
 
-template <bbq_layout Layout,
-          typename DataT,
-          typename Index_t,
-          typename ID_t = InternalID_t<Index_t>,
-          typename DistEpilogue_t>
-RAFT_KERNEL local_join_kernel_bbq_simt(const Index_t* graph_new,
-                                       const Index_t* rev_graph_new,
-                                       const int2* sizes_new,
-                                       const Index_t* graph_old,
-                                       const Index_t* rev_graph_old,
-                                       const int2* sizes_old,
-                                       const int width,
-                                       const bbq_device_quantizer_view<DataT, int64_t> dataset,
-                                       ID_t* graph,
-                                       DistData_t* dists,
-                                       int graph_width,
-                                       int* locks,
-                                       DistData_t* l2_norms,
-                                       cuvs::distance::DistanceType metric,
-                                       DistEpilogue_t dist_epilogue)
+// Selects the SIMT inner product for a (document, query) layout pair. The transposed layouts are
+// bit-sliced, so their dot product is a document_planes x query_planes cross-plane popc with a
+// per-plane shift -- code_inner_product_planes_2x1 covers every such pair, including the
+// symmetric ones (document_planes == query_planes). The densely-packed layouts have no planes to
+// cross and use dp4a instead; those forms only exist for a self-join, since dp4a needs both
+// operands in the same packing. packed_4b / packed_8b are currently unreachable from
+// GNND::local_join (packed_4b goes to the wmma kernel, packed_8b is not dispatched), but are kept
+// so either can be re-enabled as a SIMT reference point without resurrecting deleted code.
+template <bbq_layout DocumentLayout,
+          bbq_layout QueryLayout,
+          bool SelfJoin,
+          int DocumentPlanes,
+          int QueryPlanes,
+          size_t DocumentRowBytes,
+          size_t QueryRowBytes>
+__device__ __forceinline__ void bbq_code_inner_product_2x1(const uint8_t* row_a0,
+                                                           const uint8_t* row_a1,
+                                                           const uint8_t* row_b,
+                                                           uint32_t& total0,
+                                                           uint32_t& total1)
 {
-  // Cache a 128 B packed tile per row, divided evenly across the layout's bit planes.
-  // All dot-product tiles are full when ceildiv(dim, 8) is divisible by the plane tile:
-  //   1-bit, packed 4-bit, 7-bit, or 8-bit: 128 B (dim divisible by 1024).
-  //   2-bit: 64 B (dim divisible by 512).  4t: 32 B (dim divisible by 256).
-  constexpr int BBQ_ROW_BYTES = 128;
-  constexpr int BBQ_PAD       = 4;
-  static_assert((BBQ_ROW_BYTES + BBQ_PAD) % alignof(uint32_t) == 0);
-
-  __shared__ int s_list[MAX_NUM_BI_SAMPLES * 2];
-  __shared__ __align__(alignof(uint32_t)) uint8_t s_nv[MAX_NUM_BI_SAMPLES][BBQ_ROW_BYTES + BBQ_PAD];
-  __shared__ __align__(alignof(uint32_t)) uint8_t s_ov[MAX_NUM_BI_SAMPLES][BBQ_ROW_BYTES + BBQ_PAD];
-  __shared__ uint32_t s_distances_u32[MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES];
-  __shared__ int s_unique_counter[2];
-
-  if (threadIdx.x == 0) {
-    s_unique_counter[0] = 0;
-    s_unique_counter[1] = 0;
-  }
-
-  Index_t* new_neighbors = s_list;
-  Index_t* old_neighbors = s_list + MAX_NUM_BI_SAMPLES;
-  const size_t list_id   = blockIdx.x;
-  const int2 new_size2   = sizes_new[list_id];
-  const int2 old_size2   = sizes_old[list_id];
-  int new_size           = new_size2.x + new_size2.y;
-  int old_size           = old_size2.x + old_size2.y;
-  const int tx           = threadIdx.x;
-
-  if (!new_size) return;
-  if (tx < new_size2.x) {
-    new_neighbors[tx] = graph_new[list_id * width + tx];
-  } else if (tx < new_size) {
-    new_neighbors[tx] = rev_graph_new[list_id * width + tx - new_size2.x];
-  }
-  if (tx < old_size2.x) {
-    old_neighbors[tx] = graph_old[list_id * width + tx];
-  } else if (tx < old_size) {
-    old_neighbors[tx] = rev_graph_old[list_id * width + tx - old_size2.x];
-  }
-  __syncthreads();
-
-  remove_duplicates(
-    new_neighbors, new_size2.x, new_neighbors + new_size2.x, new_size2.y, s_unique_counter[0], 0);
-  remove_duplicates(
-    old_neighbors, old_size2.x, old_neighbors + old_size2.x, old_size2.y, s_unique_counter[1], 1);
-  __syncthreads();
-  new_size = new_size2.x + s_unique_counter[0];
-  old_size = old_size2.x + s_unique_counter[1];
-
-  const int warp_id       = threadIdx.x / raft::warp_size();
-  const int lane_id       = threadIdx.x % raft::warp_size();
-  constexpr int num_warps = BLOCK_SIZE / raft::warp_size();
-  const uint8_t* codes    = dataset.codes.data_handle();
-  const size_t encoded_row_length =
-    cuvs::preprocessing::quantize::bbq::get_encoded_row_length(dataset);
-  constexpr int n_planes = Layout == bbq_layout::transposed_2b   ? 2
-                           : Layout == bbq_layout::transposed_4b ? 4
-                                                                 : 1;
-  // Each plane gets an equal slice of the row in shared memory, so the cached bytes always form a
-  // valid encoded chunk.
-  const size_t plane_bytes  = encoded_row_length / static_cast<size_t>(n_planes);
-  const int plane_tile      = BBQ_ROW_BYTES / n_planes;
-  static_assert(BBQ_ROW_BYTES % 4 == 0, "BBQ_ROW_BYTES must allow 4-byte aligned plane tiles");
-  // plane_bytes is the per-plane stride in bytes; plane_extent is the same in uint32 elements,
-  // computed once so call sites don't re-derive it. Alignment (plane_bytes % 4 == 0, i.e.
-  // encoded_row_length % (4*n_planes) == 0) is enforced by the launcher.
-  const int plane_extent       = static_cast<int>(plane_bytes) / 4;
-  constexpr int plane_tile_u32 = plane_tile / 4;
-  const int n_tiles            = raft::ceildiv(static_cast<int>(plane_bytes), plane_tile);
-
-  for (int i = tx; i < MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES; i += blockDim.x) {
-    s_distances_u32[i] = 0;
-  }
-  // there is sync inside the loop, so no need to sync here
-
-  for (int step = 0; step < n_tiles; ++step) {
-    const bool last_tile = (step == n_tiles - 1);
-    const int num_load = last_tile ? static_cast<int>(plane_bytes) - step * plane_tile : plane_tile;
-    const int num_load_u32 = num_load / 4;
-    const size_t base = static_cast<size_t>(step) * plane_tile;
-    for (int i = 0; i < MAX_NUM_BI_SAMPLES / num_warps; ++i) {
-      const int idx = i * num_warps + warp_id;
-      if (idx < new_size) {
-        auto* s_nv_u32 = reinterpret_cast<uint32_t*>(s_nv[idx]);
-        load_vec_bbq_simt<n_planes>(
-          s_nv_u32,
-          reinterpret_cast<const uint32_t*>(&dataset.codes(new_neighbors[idx], base)),
-          plane_extent,
-          num_load_u32,
-          plane_tile_u32,
-          lane_id);
-        if (last_tile) {
-          zero_pad_bbq_simt<n_planes>(s_nv_u32, num_load_u32, plane_tile_u32, lane_id);
-        }
-      }
-    }
-    __syncthreads();
-
-    constexpr int num_row_pairs = MAX_NUM_BI_SAMPLES / 2;
-    for (int pair_idx = tx; pair_idx < num_row_pairs * MAX_NUM_BI_SAMPLES; pair_idx += blockDim.x) {
-      const int row0 = (pair_idx / MAX_NUM_BI_SAMPLES) * 2;
-      const int col  = pair_idx % MAX_NUM_BI_SAMPLES;
-      if (col < new_size) {
-        const int distance0 = row0 * SKEWED_MAX_NUM_BI_SAMPLES + col;
-        uint32_t total0     = 0;
-        uint32_t total1     = 0;
-        if constexpr (Layout == bbq_layout::packed_1b) {
-          cuvs::preprocessing::quantize::bbq::code_inner_product_binary_2x1<BBQ_ROW_BYTES>(
-            s_nv[row0], s_nv[row0 + 1], s_nv[col], total0, total1);
-        } else if constexpr (Layout == bbq_layout::transposed_2b) {
-          cuvs::preprocessing::quantize::bbq::code_inner_product_transposed_2b_symmetric_2x1<
-            BBQ_ROW_BYTES>(s_nv[row0], s_nv[row0 + 1], s_nv[col], total0, total1);
-        } else if constexpr (Layout == bbq_layout::packed_4b) {
-          cuvs::preprocessing::quantize::bbq::code_inner_product_packed_4b_symmetric_2x1<
-            BBQ_ROW_BYTES>(s_nv[row0], s_nv[row0 + 1], s_nv[col], total0, total1);
-        } else if constexpr (Layout == bbq_layout::transposed_4b) {
-          cuvs::preprocessing::quantize::bbq::code_inner_product_transposed_4b_symmetric_2x1<
-            BBQ_ROW_BYTES>(s_nv[row0], s_nv[row0 + 1], s_nv[col], total0, total1);
-        } else {
-          cuvs::preprocessing::quantize::bbq::code_inner_product_packed_8b_2x1<BBQ_ROW_BYTES>(
-            s_nv[row0],
-            s_nv[row0 + 1],
-            s_nv[col],
-            total0,
-            total1,
-            static_cast<uint8_t>((uint32_t{1} << dataset.bits) - 1));
-        }
-        s_distances_u32[distance0] += total0;
-        if (row0 + 1 < new_size) {
-          s_distances_u32[distance0 + SKEWED_MAX_NUM_BI_SAMPLES] += total1;
-        }
-      }
-    }
-    __syncthreads();
-  }
-
-  for (int step = 0; step < raft::ceildiv(new_size, num_warps); ++step) {
-    const int idx_in_list = step * num_warps + tx / raft::warp_size();
-    if (idx_in_list >= new_size) continue;
-    auto min_elem = get_min_item_fused(s_list[idx_in_list],
-                                       idx_in_list,
-                                       new_neighbors,
-                                       new_size,
-                                       s_distances_u32,
-                                       dataset,
-                                       dataset,
-                                       l2_norms,
-                                       l2_norms,
-                                       metric,
-                                       dist_epilogue);
-    if (min_elem.id() < gridDim.x) {
-      insert_to_global_graph(min_elem, s_list[idx_in_list], graph, dists, graph_width, locks);
-    }
-  }
-
-  if (!old_size) return;
-  __syncthreads();
-
-  for (int i = tx; i < MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES; i += blockDim.x) {
-    s_distances_u32[i] = 0;
-  }
-  // there is sync inside the loop, so no need to sync here
-
-  for (int step = 0; step < n_tiles; ++step) {
-    const bool last_tile = (step == n_tiles - 1);
-    const int num_load = last_tile ? static_cast<int>(plane_bytes) - step * plane_tile : plane_tile;
-    const int num_load_u32 = num_load / 4;
-    const size_t base = static_cast<size_t>(step) * plane_tile;
-    if (n_tiles > 1) {
-      for (int i = 0; i < MAX_NUM_BI_SAMPLES / num_warps; ++i) {
-        const int idx = i * num_warps + warp_id;
-        if (idx < new_size) {
-          auto* s_nv_u32 = reinterpret_cast<uint32_t*>(s_nv[idx]);
-          load_vec_bbq_simt<n_planes>(
-            s_nv_u32,
-            reinterpret_cast<const uint32_t*>(&dataset.codes(new_neighbors[idx], base)),
-            plane_extent,
-            num_load_u32,
-            plane_tile_u32,
-            lane_id);
-          if (last_tile) {
-            zero_pad_bbq_simt<n_planes>(s_nv_u32, num_load_u32, plane_tile_u32, lane_id);
-          }
-        }
-      }
-    }
-    for (int i = 0; i < MAX_NUM_BI_SAMPLES / num_warps; ++i) {
-      const int idx = i * num_warps + warp_id;
-      if (idx < old_size) {
-        auto* s_ov_u32 = reinterpret_cast<uint32_t*>(s_ov[idx]);
-        load_vec_bbq_simt<n_planes>(
-          s_ov_u32,
-          reinterpret_cast<const uint32_t*>(&dataset.codes(old_neighbors[idx], base)),
-          plane_extent,
-          num_load_u32,
-          plane_tile_u32,
-          lane_id);
-        if (last_tile) {
-          zero_pad_bbq_simt<n_planes>(s_ov_u32, num_load_u32, plane_tile_u32, lane_id);
-        }
-      }
-    }
-    __syncthreads();
-
-    constexpr int num_row_pairs = MAX_NUM_BI_SAMPLES / 2;
-    for (int pair_idx = tx; pair_idx < num_row_pairs * MAX_NUM_BI_SAMPLES; pair_idx += blockDim.x) {
-      const int row0 = (pair_idx / MAX_NUM_BI_SAMPLES) * 2;
-      const int col  = pair_idx % MAX_NUM_BI_SAMPLES;
-      if (col < old_size) {
-        const int distance0 = row0 * SKEWED_MAX_NUM_BI_SAMPLES + col;
-        uint32_t total0     = 0;
-        uint32_t total1     = 0;
-        if constexpr (Layout == bbq_layout::packed_1b) {
-          cuvs::preprocessing::quantize::bbq::code_inner_product_binary_2x1<BBQ_ROW_BYTES>(
-            s_nv[row0], s_nv[row0 + 1], s_ov[col], total0, total1);
-        } else if constexpr (Layout == bbq_layout::transposed_2b) {
-          cuvs::preprocessing::quantize::bbq::code_inner_product_transposed_2b_symmetric_2x1<
-            BBQ_ROW_BYTES>(s_nv[row0], s_nv[row0 + 1], s_ov[col], total0, total1);
-        } else if constexpr (Layout == bbq_layout::packed_4b) {
-          cuvs::preprocessing::quantize::bbq::code_inner_product_packed_4b_symmetric_2x1<
-            BBQ_ROW_BYTES>(s_nv[row0], s_nv[row0 + 1], s_ov[col], total0, total1);
-        } else if constexpr (Layout == bbq_layout::transposed_4b) {
-          cuvs::preprocessing::quantize::bbq::code_inner_product_transposed_4b_symmetric_2x1<
-            BBQ_ROW_BYTES>(s_nv[row0], s_nv[row0 + 1], s_ov[col], total0, total1);
-        } else {
-          cuvs::preprocessing::quantize::bbq::code_inner_product_packed_8b_2x1<BBQ_ROW_BYTES>(
-            s_nv[row0],
-            s_nv[row0 + 1],
-            s_ov[col],
-            total0,
-            total1,
-            static_cast<uint8_t>((uint32_t{1} << dataset.bits) - 1));
-        }
-        s_distances_u32[distance0] += total0;
-        if (row0 + 1 < new_size) {
-          s_distances_u32[distance0 + SKEWED_MAX_NUM_BI_SAMPLES] += total1;
-        }
-      }
-    }
-    __syncthreads();
-  }
-
-  for (int step = 0; step < raft::ceildiv(MAX_NUM_BI_SAMPLES * 2, num_warps); ++step) {
-    const int idx_in_list = step * num_warps + tx / raft::warp_size();
-    if (idx_in_list >= new_size && idx_in_list < MAX_NUM_BI_SAMPLES) continue;
-    if (idx_in_list >= MAX_NUM_BI_SAMPLES + old_size && idx_in_list < MAX_NUM_BI_SAMPLES * 2) {
-      continue;
-    }
-
-    ResultItem<Index_t> min_elem{std::numeric_limits<Index_t>::max(),
-                                 std::numeric_limits<DistData_t>::max()};
-    if (idx_in_list < MAX_NUM_BI_SAMPLES) {
-      auto temp_min_item = get_min_item_fused(s_list[idx_in_list],
-                                              idx_in_list,
-                                              old_neighbors,
-                                              old_size,
-                                              s_distances_u32,
-                                              dataset,
-                                              dataset,
-                                              l2_norms,
-                                              l2_norms,
-                                              metric,
-                                              dist_epilogue);
-      if (temp_min_item.dist() < min_elem.dist()) { min_elem = temp_min_item; }
-    } else {
-      auto temp_min_item = get_min_item_fused(s_list[idx_in_list],
-                                              idx_in_list - MAX_NUM_BI_SAMPLES,
-                                              new_neighbors,
-                                              new_size,
-                                              s_distances_u32,
-                                              dataset,
-                                              dataset,
-                                              l2_norms,
-                                              l2_norms,
-                                              metric,
-                                              dist_epilogue,
-                                              false);
-      if (temp_min_item.dist() < min_elem.dist()) { min_elem = temp_min_item; }
-    }
-    if (min_elem.id() < gridDim.x) {
-      insert_to_global_graph(min_elem, s_list[idx_in_list], graph, dists, graph_width, locks);
-    }
+  namespace bbq = cuvs::preprocessing::quantize::bbq;
+  if constexpr (SelfJoin && DocumentLayout == bbq_layout::packed_4b) {
+    bbq::code_inner_product_packed_4b_symmetric_2x1<DocumentRowBytes>(
+      row_a0, row_a1, row_b, total0, total1);
+  } else if constexpr (SelfJoin && DocumentLayout == bbq_layout::packed_8b) {
+    bbq::code_inner_product_packed_8b_2x1<DocumentRowBytes>(row_a0, row_a1, row_b, total0, total1);
+  } else {
+    bbq::
+      code_inner_product_planes_2x1<DocumentPlanes, QueryPlanes, DocumentRowBytes, QueryRowBytes>(
+        row_a0, row_a1, row_b, total0, total1);
   }
 }
 
 template <bbq_layout DocumentLayout,
           bbq_layout QueryLayout,
+          bool SelfJoin,
           typename DataT,
           typename Index_t,
           typename ID_t = InternalID_t<Index_t>,
           typename DistEpilogue_t>
 RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
-  local_join_kernel_bbq_asymmetric_simt(const Index_t* graph_new,
-                                        const Index_t* rev_graph_new,
-                                        const int2* sizes_new,
-                                        const Index_t* graph_old,
-                                        const Index_t* rev_graph_old,
-                                        const int2* sizes_old,
-                                        const int width,
-                                        bbq_device_quantizer_view<DataT, int64_t> dataset_document,
-                                        bbq_device_quantizer_view<DataT, int64_t> dataset_query,
-                                        ID_t* graph,
-                                        DistData_t* dists,
-                                        int graph_width,
-                                        int* locks,
-                                        DistData_t* l2_norms_document,
-                                        DistData_t* l2_norms_query,
-                                        cuvs::distance::DistanceType metric,
-                                        DistEpilogue_t dist_epilogue)
+  local_join_kernel_bbq_simt(const Index_t* graph_new,
+                             const Index_t* rev_graph_new,
+                             const int2* sizes_new,
+                             const Index_t* graph_old,
+                             const Index_t* rev_graph_old,
+                             const int2* sizes_old,
+                             const int width,
+                             bbq_device_quantizer_view<DataT, int64_t> dataset_document,
+                             bbq_device_quantizer_view<DataT, int64_t> dataset_query,
+                             ID_t* graph,
+                             DistData_t* dists,
+                             int graph_width,
+                             int* locks,
+                             DistData_t* l2_norms_document,
+                             DistData_t* l2_norms_query,
+                             cuvs::distance::DistanceType metric,
+                             DistEpilogue_t dist_epilogue)
 {
-  // Cache packed code tiles per row. All dot-product tiles are full when
-  // ceildiv(dim, 8) is divisible by each per-plane tile size:
-  //   1-bit document + 2-bit query: 64 B per plane (dim divisible by 512).
-  //   1-bit document + 4t query: 64 B document / 32 B query planes (dim divisible by 512).
-  //   2-bit document + 4t query: 32 B per plane (dim divisible by 256).
-  constexpr int BBQ_ROW_BYTES       = 64;
-  constexpr int BBQ_QUERY_ROW_BYTES = 128;
-  constexpr int BBQ_PAD             = alignof(uint32_t);
-  static_assert((BBQ_ROW_BYTES + BBQ_PAD) % alignof(uint32_t) == 0);
-  static_assert((BBQ_QUERY_ROW_BYTES + BBQ_PAD) % alignof(uint32_t) == 0);
-  constexpr int document_bits = DocumentLayout == bbq_layout::packed_1b       ? 1
-                                : DocumentLayout == bbq_layout::transposed_2b ? 2
-                                                                              : 0;
-  constexpr int query_bits    = QueryLayout == bbq_layout::transposed_2b   ? 2
-                                : QueryLayout == bbq_layout::transposed_4b ? 4
-                                                                           : 0;
-  static_assert(
-    (DocumentLayout == bbq_layout::packed_1b &&
-     (QueryLayout == bbq_layout::transposed_2b || QueryLayout == bbq_layout::transposed_4b)) ||
-    (DocumentLayout == bbq_layout::transposed_2b && QueryLayout == bbq_layout::transposed_4b));
+  // Plane count per layout: the transposed layouts are bit-sliced into `N` planes, the packed
+  // ones are a single dense plane. This is the only thing the tiling needs from the layout.
+  constexpr auto planes_of = [](bbq_layout l) {
+    return l == bbq_layout::transposed_2b ? 2 : l == bbq_layout::transposed_4b ? 4 : 1;
+  };
+  constexpr int document_planes = planes_of(DocumentLayout);
+  constexpr int query_planes    = planes_of(QueryLayout);
+  static_assert(!SelfJoin || DocumentLayout == QueryLayout,
+                "a self-join must use the same layout on both operands");
+
+  // Both operands are tiled at the same per-plane tile so each step covers the same dimension
+  // range on both sides. QUERY_ROW_BYTES fixes the query row width; the document row width then
+  // follows as QUERY_ROW_BYTES / (query_planes / document_planes), i.e. query_plane_tile scaled
+  // by the document's own plane count. Worked out per supported pair:
+  //
+  //   pair     query_plane_tile   doc_row_bytes    doc_stride   query_stride
+  //   ------   ----------------   --------------   ----------   ------------
+  //   1 x 1    128                128 * 1 = 128    128          128
+  //   2t x 2t  64                 64  * 2 = 128    64           64
+  //   1 + 2t   64                 64  * 1 = 64     64           64
+  //   1 + 4t   32                 32  * 1 = 32     32           32
+  //   2t + 4t  32                 32  * 2 = 64     32           32
+  //
+  constexpr int QUERY_ROW_BYTES = 128;
+  constexpr int BBQ_PAD         = alignof(uint32_t);
+  // The document buffer is normally only the A operand (two rows broadcast across a warp), so it
+  // needs no bank-conflict pad. Under SelfJoin it doubles as the B operand in phase 1 (32
+  // consecutive columns at one byte offset), so it needs the same skew the query buffer gets.
+  constexpr int DOC_PAD = SelfJoin ? BBQ_PAD : 0;
+  static_assert((QUERY_ROW_BYTES + BBQ_PAD) % alignof(uint32_t) == 0);
 
   __shared__ int s_list[MAX_NUM_BI_SAMPLES * 2];
-  // Document rows are only the A operands (same two rows broadcast in a warp): no bank-conflict
-  // pad. Query rows are the B operand (32 consecutive cols at the same byte offset): pad to skew
-  // banks.
-  __shared__ __align__(alignof(uint32_t)) uint8_t s_doc_vec[MAX_NUM_BI_SAMPLES][BBQ_ROW_BYTES];
+  __shared__ __align__(alignof(uint32_t)) uint8_t
+    s_doc_vec[MAX_NUM_BI_SAMPLES][QUERY_ROW_BYTES / query_planes * document_planes + DOC_PAD];
   __shared__ __align__(alignof(uint32_t))
-    uint8_t s_query_vec[MAX_NUM_BI_SAMPLES][BBQ_QUERY_ROW_BYTES + BBQ_PAD];
+    uint8_t s_query_vec[MAX_NUM_BI_SAMPLES][QUERY_ROW_BYTES + BBQ_PAD];
   __shared__ uint32_t s_distances_u32[MAX_NUM_BI_SAMPLES * SKEWED_MAX_NUM_BI_SAMPLES];
   __shared__ int s_unique_counter[2];
 
@@ -1406,28 +1143,12 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
   // Each plane gets an equal slice of the row in shared memory, so the cached bytes always form a
   // valid encoded chunk.
   const int plane_bytes          = raft::ceildiv(static_cast<int>(dataset_document.dim()), 8);
-  constexpr int query_plane_tile = BBQ_QUERY_ROW_BYTES / query_bits;
-  // Tile both document and query at query_plane_tile so each step covers the same dimension
-  // range in both buffers; this removes the per-step query sub-tile loop. doc_row_bytes is the
-  // document row width passed to the dot product so that document_plane_stride ==
-  // query_plane_stride (= query_plane_tile) for every supported (document_bits, query_bits) pair:
-  //
-  //   pair   query_plane_tile   doc_row_bytes        doc_stride   query_stride   iters/step
-  //   ----   ----------------   -----------------    ----------   ------------   ----------
-  //   1+2    64                 64  * 1 = 64         64           64             1
-  //   2+4t   32                 32  * 2 = 64         32           32             1
-  //   1+4t   32                 32  * 1 = 32         32           32             1
-  //
-  // doc_stride  = doc_row_bytes  / document_bits
-  // query_stride = BBQ_QUERY_ROW_BYTES / query_bits = query_plane_tile
-  //
-  constexpr int plane_tile    = query_plane_tile;
-  constexpr int doc_row_bytes = query_plane_tile * document_bits;
+  constexpr int query_plane_tile = QUERY_ROW_BYTES / query_planes;
+  constexpr int plane_tile       = query_plane_tile;
+  constexpr int doc_row_bytes    = query_plane_tile * document_planes;
   static_assert(plane_tile % 4 == 0, "plane_tile must be 4-byte aligned for uint32 loads");
-  static_assert(query_plane_tile % 4 == 0,
-                "query_plane_tile must be 4-byte aligned for uint32 loads");
   static_assert(
-    doc_row_bytes % document_bits == 0 && doc_row_bytes / document_bits == query_plane_tile,
+    doc_row_bytes % document_planes == 0 && doc_row_bytes / document_planes == query_plane_tile,
     "document plane stride must match query plane stride");
   // plane_bytes is the per-plane stride in bytes; plane_extent is the same in uint32 elements,
   // computed once so call sites don't re-derive it. Alignment (plane_bytes % 4 == 0, i.e.
@@ -1449,7 +1170,7 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
       const int idx = i * num_warps + warp_id;
       if (idx < new_size) {
         auto* s_doc = reinterpret_cast<uint32_t*>(s_doc_vec[idx]);
-        load_vec_bbq_simt<document_bits>(
+        load_vec_bbq_simt<document_planes>(
           s_doc,
           reinterpret_cast<const uint32_t*>(&dataset_document.codes(new_neighbors[idx], base)),
           plane_extent,
@@ -1457,7 +1178,7 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
           plane_tile_u32,
           lane_id);
         if (last_tile) {
-          zero_pad_bbq_simt<document_bits>(s_doc, num_load_u32, plane_tile_u32, lane_id);
+          zero_pad_bbq_simt<document_planes>(s_doc, num_load_u32, plane_tile_u32, lane_id);
         }
       }
     }
@@ -1465,24 +1186,29 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
 
     // Query and document tiles cover the same dimension range per step (both tile at
     // query_plane_tile), so load the query tile once and run the dot product directly -- no
-    // per-step query sub-tile loop.
-    for (int i = 0; i < MAX_NUM_BI_SAMPLES / num_warps; ++i) {
-      const int idx = i * num_warps + warp_id;
-      if (idx < new_size) {
-        auto* s_q = reinterpret_cast<uint32_t*>(s_query_vec[idx]);
-        load_vec_bbq_simt<query_bits>(
-          s_q,
-          reinterpret_cast<const uint32_t*>(&dataset_query.codes(new_neighbors[idx], base)),
-          plane_extent,
-          num_load_u32,
-          query_plane_tile_u32,
-          lane_id);
-        if (last_tile) {
-          zero_pad_bbq_simt<query_bits>(s_q, num_load_u32, query_plane_tile_u32, lane_id);
+    // per-step query sub-tile loop. Under SelfJoin phase 1 is new x new on a single quantizer,
+    // so the document buffer already holds exactly what the query buffer would: skip the load
+    // and point the B operand at s_doc_vec. This is the SIMT twin of the wmma kernel's phase-1
+    // buffer alias, and halves this phase's staging traffic.
+    if constexpr (!SelfJoin) {
+      for (int i = 0; i < MAX_NUM_BI_SAMPLES / num_warps; ++i) {
+        const int idx = i * num_warps + warp_id;
+        if (idx < new_size) {
+          auto* s_q = reinterpret_cast<uint32_t*>(s_query_vec[idx]);
+          load_vec_bbq_simt<query_planes>(
+            s_q,
+            reinterpret_cast<const uint32_t*>(&dataset_query.codes(new_neighbors[idx], base)),
+            plane_extent,
+            num_load_u32,
+            query_plane_tile_u32,
+            lane_id);
+          if (last_tile) {
+            zero_pad_bbq_simt<query_planes>(s_q, num_load_u32, query_plane_tile_u32, lane_id);
+          }
         }
       }
+      __syncthreads();
     }
-    __syncthreads();
 
     // Pitch columns by MAX_NUM_BI_SAMPLES (multiple of warp size) so a warp never straddles
     // row-pair boundaries. SKEWED is only for the distance matrix layout.
@@ -1494,11 +1220,26 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
         const int distance0 = row0 * SKEWED_MAX_NUM_BI_SAMPLES + col;
         uint32_t total0     = 0;
         uint32_t total1     = 0;
-        cuvs::preprocessing::quantize::bbq::code_inner_product_asymmetric_2x1<document_bits,
-                                                                              query_bits,
-                                                                              doc_row_bytes,
-                                                                              BBQ_QUERY_ROW_BYTES>(
-          s_doc_vec[row0], s_doc_vec[row0 + 1], s_query_vec[col], total0, total1);
+        // Phase 1 B operand: s_doc_vec under SelfJoin (see the staging note above).
+        if constexpr (SelfJoin) {
+          bbq_code_inner_product_2x1<DocumentLayout,
+                                     QueryLayout,
+                                     SelfJoin,
+                                     document_planes,
+                                     query_planes,
+                                     doc_row_bytes,
+                                     QUERY_ROW_BYTES>(
+            s_doc_vec[row0], s_doc_vec[row0 + 1], s_doc_vec[col], total0, total1);
+        } else {
+          bbq_code_inner_product_2x1<DocumentLayout,
+                                     QueryLayout,
+                                     SelfJoin,
+                                     document_planes,
+                                     query_planes,
+                                     doc_row_bytes,
+                                     QUERY_ROW_BYTES>(
+            s_doc_vec[row0], s_doc_vec[row0 + 1], s_query_vec[col], total0, total1);
+        }
         s_distances_u32[distance0] += total0;
         if (row0 + 1 < new_size) {
           s_distances_u32[distance0 + SKEWED_MAX_NUM_BI_SAMPLES] += total1;
@@ -1544,7 +1285,7 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
         const int idx = i * num_warps + warp_id;
         if (idx < new_size) {
           auto* s_doc = reinterpret_cast<uint32_t*>(s_doc_vec[idx]);
-          load_vec_bbq_simt<document_bits>(
+          load_vec_bbq_simt<document_planes>(
             s_doc,
             reinterpret_cast<const uint32_t*>(&dataset_document.codes(new_neighbors[idx], base)),
             plane_extent,
@@ -1552,7 +1293,7 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
             plane_tile_u32,
             lane_id);
           if (last_tile) {
-            zero_pad_bbq_simt<document_bits>(s_doc, num_load_u32, plane_tile_u32, lane_id);
+            zero_pad_bbq_simt<document_planes>(s_doc, num_load_u32, plane_tile_u32, lane_id);
           }
         }
       }
@@ -1562,7 +1303,7 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
       const int idx = i * num_warps + warp_id;
       if (idx < old_size) {
         auto* s_q = reinterpret_cast<uint32_t*>(s_query_vec[idx]);
-        load_vec_bbq_simt<query_bits>(
+        load_vec_bbq_simt<query_planes>(
           s_q,
           reinterpret_cast<const uint32_t*>(&dataset_query.codes(old_neighbors[idx], base)),
           plane_extent,
@@ -1570,7 +1311,7 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
           query_plane_tile_u32,
           lane_id);
         if (last_tile) {
-          zero_pad_bbq_simt<query_bits>(s_q, num_load_u32, query_plane_tile_u32, lane_id);
+          zero_pad_bbq_simt<query_planes>(s_q, num_load_u32, query_plane_tile_u32, lane_id);
         }
       }
     }
@@ -1586,10 +1327,13 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
         const int distance0 = row0 * SKEWED_MAX_NUM_BI_SAMPLES + col;
         uint32_t total0     = 0;
         uint32_t total1     = 0;
-        cuvs::preprocessing::quantize::bbq::code_inner_product_asymmetric_2x1<document_bits,
-                                                                              query_bits,
-                                                                              doc_row_bytes,
-                                                                              BBQ_QUERY_ROW_BYTES>(
+        bbq_code_inner_product_2x1<DocumentLayout,
+                                   QueryLayout,
+                                   SelfJoin,
+                                   document_planes,
+                                   query_planes,
+                                   doc_row_bytes,
+                                   QUERY_ROW_BYTES>(
           s_doc_vec[row0], s_doc_vec[row0 + 1], s_query_vec[col], total0, total1);
         s_distances_u32[distance0] += total0;
         if (row0 + 1 < new_size) {
@@ -1800,7 +1544,7 @@ __device__ __forceinline__ void stage_promoted_tile(
 //     rows, so aliasing them would compute doc.doc, a different (worse) estimator.
 //   * The metric side needs no branch at all -- get_min_item_fused's two-quantizer overloads are
 //     exact generalizations of the single-quantizer ones, so symmetric just passes the same
-//     quantizer and l2_norms twice. See TENSOR_CORE_NOTES.md.
+//     quantizer and l2_norms twice.
 //
 // Warp tiling: num_warps = BLOCK_SIZE/32 warps arranged as a WARPS_PER_DIM x WARPS_PER_DIM square
 // grid (WARPS_PER_DIM=4 so 4x4=16=num_warps), each warp owning a (MAX_NUM_BI_SAMPLES/WARPS_PER_DIM)
@@ -2763,15 +2507,8 @@ void GNND<Data_t, Index_t>::local_join(cudaStream_t stream,
   raft::matrix::fill(res, dists_buffer_.view(), std::numeric_limits<float>::max());
   const bool has_1b = dataset.has_bit_and_layout(1, bbq_layout::packed_1b);
   const bool has_4b = dataset.has_bit_and_layout(4, bbq_layout::packed_4b);
-  // nnd-bbq-tc: int4 tensor-core asymmetric path -- packed_2b at bits=2 (document, 2x4) or
-  // packed_1b at bits=1 (document, 1x4) paired with a packed_4b query (bits=4). Both
-  // document layouts are dense on-disk formats promoted to 4-bit width during SMEM staging in
-  // local_join_kernel_bbq_wmma. This is the only asymmetric path this branch
-  // supports -- the scalar asymmetric kernel and its other pairs (packed_1b+transposed_2b,
-  // packed_1b+transposed_4b, transposed_2b+transposed_4b) were removed once int4 covered
-  // the pairs this branch cares about; transposed_2b's bit-plane layout can't be reused for
-  // packed_4b pairing since its scalar decode algorithm genuinely depends on the bit-plane
-  // structure. See TENSOR_CORE_NOTES.md.
+  // int4 tensor-core asymmetric path: a packed_2b or packed_1b document promoted to 4-bit width
+  // against a packed_4b query.
   const bool has_2b  = dataset.has_bit_and_layout(2, bbq_layout::packed_2b);
   const bool has_2bt = dataset.has_bit_and_layout(2, bbq_layout::transposed_2b);
   const bool has_4bt = dataset.has_bit_and_layout(4, bbq_layout::transposed_4b);
@@ -2854,7 +2591,7 @@ void GNND<Data_t, Index_t>::local_join(cudaStream_t stream,
     auto launch_asymmetric_simt = [&](auto document_layout, auto query_layout) {
       constexpr auto DocumentLayout = decltype(document_layout)::value;
       constexpr auto QueryLayout    = decltype(query_layout)::value;
-      local_join_kernel_bbq_asymmetric_simt<DocumentLayout, QueryLayout>
+      local_join_kernel_bbq_simt<DocumentLayout, QueryLayout, /*SelfJoin=*/false>
         <<<nrow_, BLOCK_SIZE, 0, stream>>>(graph_.h_graph_new.data_handle(),
                                            h_rev_graph_new_.data_handle(),
                                            d_list_sizes_new_.data_handle(),
@@ -2915,12 +2652,13 @@ void GNND<Data_t, Index_t>::local_join(cudaStream_t stream,
     if (build_config_.metric == cuvs::distance::DistanceType::CosineExpanded) {
       raft::linalg::map_offset(res, l2_norms_.view(), bbq::bbq_row_norm_op{quantizer});
     }
-    // nnd-bbq-tc: packed_4b goes through the int4 tensor-core path; packed_1b/transposed_2b are
-    // kept on the original scalar popc/dp4a path as reference points. transposed_4b/packed_7b/
-    // packed_8b were dropped from this branch's dispatch (see TENSOR_CORE_NOTES.md).
+    // packed_4b goes through the int4 tensor-core path; packed_1b/transposed_2b stay on the SIMT
+    // path as reference points. transposed_4b/packed_7b/packed_8b are not dispatched.
     auto launch_symmetric = [&](auto layout) {
       constexpr auto Layout = decltype(layout)::value;
-      local_join_kernel_bbq_simt<Layout>
+      // Symmetric = the same quantizer on both operands: pass it (and l2_norms) twice and set
+      // SelfJoin so phase 1 skips the redundant staging and aliases the buffer.
+      local_join_kernel_bbq_simt<Layout, Layout, /*SelfJoin=*/true>
         <<<nrow_, BLOCK_SIZE, 0, stream>>>(graph_.h_graph_new.data_handle(),
                                            h_rev_graph_new_.data_handle(),
                                            d_list_sizes_new_.data_handle(),
@@ -2929,10 +2667,12 @@ void GNND<Data_t, Index_t>::local_join(cudaStream_t stream,
                                            d_list_sizes_old_.data_handle(),
                                            NUM_SAMPLES,
                                            quantizer,
+                                           quantizer,
                                            graph_buffer_.data_handle(),
                                            dists_buffer_.data_handle(),
                                            DEGREE_ON_DEVICE,
                                            d_locks_.data_handle(),
+                                           l2_norms_.data_handle(),
                                            l2_norms_.data_handle(),
                                            build_config_.metric,
                                            dist_epilogue);

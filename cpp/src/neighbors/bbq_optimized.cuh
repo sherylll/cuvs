@@ -36,21 +36,26 @@ __device__ inline void code_inner_product_binary_2x1(const uint8_t* row_a0,
   }
 }
 
-/** Two asymmetric inner products over statically known document and query plane counts. */
-template <int document_bits, int query_bits, size_t document_row_bytes, size_t query_row_bytes>
-__device__ inline void code_inner_product_asymmetric_2x1(const uint8_t* row_a0,
-                                                         const uint8_t* row_a1,
-                                                         const uint8_t* row_b,
-                                                         uint32_t& total0,
-                                                         uint32_t& total1)
+/**
+ * Two cross-plane inner products over statically known document and query plane counts.
+ * Not asymmetric-specific: a symmetric pair is just document_planes == query_planes, which is how
+ * the 1x1 and 2t x 2t self-joins are computed. Supersedes the hand-written 2x2 and 4x4
+ * specialisations this replaced.
+ */
+template <int document_planes, int query_planes, size_t document_row_bytes, size_t query_row_bytes>
+__device__ inline void code_inner_product_planes_2x1(const uint8_t* row_a0,
+                                                     const uint8_t* row_a1,
+                                                     const uint8_t* row_b,
+                                                     uint32_t& total0,
+                                                     uint32_t& total1)
 {
-  constexpr size_t document_plane_stride = document_row_bytes / document_bits;
-  constexpr size_t query_plane_stride    = query_row_bytes / query_bits;
+  constexpr size_t document_plane_stride = document_row_bytes / document_planes;
+  constexpr size_t query_plane_stride    = query_row_bytes / query_planes;
   static_assert(query_plane_stride % sizeof(uint32_t) == 0);
 #pragma unroll
-  for (int p_query = 0; p_query < query_bits; ++p_query) {
+  for (int p_query = 0; p_query < query_planes; ++p_query) {
 #pragma unroll
-    for (int p_document = 0; p_document < document_bits; ++p_document) {
+    for (int p_document = 0; p_document < document_planes; ++p_document) {
       uint32_t partial0 = 0;
       uint32_t partial1 = 0;
       code_inner_product_binary_2x1<query_plane_stride>(row_a0 + p_document * document_plane_stride,
@@ -60,56 +65,6 @@ __device__ inline void code_inner_product_asymmetric_2x1(const uint8_t* row_a0,
                                                         partial1);
       total0 += partial0 << (p_document + p_query);
       total1 += partial1 << (p_document + p_query);
-    }
-  }
-}
-
-/** Two two-bit transposed inner products with a shared right operand. */
-template <size_t n_bytes>
-__device__ inline void code_inner_product_transposed_2b_symmetric_2x1(const uint8_t* row_a0,
-                                                                      const uint8_t* row_a1,
-                                                                      const uint8_t* row_b,
-                                                                      uint32_t& total0,
-                                                                      uint32_t& total1)
-{
-  static_assert(n_bytes % (2 * sizeof(uint32_t)) == 0);
-  const size_t stripe_size = n_bytes / 2;
-  for (int i = 0; i < 2; ++i) {
-    for (int j = 0; j < 2; ++j) {
-      uint32_t partial0 = 0;
-      uint32_t partial1 = 0;
-      code_inner_product_binary_2x1<n_bytes / 2>(row_a0 + i * stripe_size,
-                                                 row_a1 + i * stripe_size,
-                                                 row_b + j * stripe_size,
-                                                 partial0,
-                                                 partial1);
-      total0 += partial0 << (i + j);
-      total1 += partial1 << (i + j);
-    }
-  }
-}
-
-/** Two four-bit transposed inner products with a shared right operand. */
-template <size_t n_bytes>
-__device__ inline void code_inner_product_transposed_4b_symmetric_2x1(const uint8_t* row_a0,
-                                                                      const uint8_t* row_a1,
-                                                                      const uint8_t* row_b,
-                                                                      uint32_t& total0,
-                                                                      uint32_t& total1)
-{
-  static_assert(n_bytes % (4 * sizeof(uint32_t)) == 0);
-  const size_t stripe_size = n_bytes / 4;
-  for (int i = 0; i < 4; ++i) {
-    for (int j = 0; j < 4; ++j) {
-      uint32_t partial0 = 0;
-      uint32_t partial1 = 0;
-      code_inner_product_binary_2x1<n_bytes / 4>(row_a0 + i * stripe_size,
-                                                 row_a1 + i * stripe_size,
-                                                 row_b + j * stripe_size,
-                                                 partial0,
-                                                 partial1);
-      total0 += partial0 << (i + j);
-      total1 += partial1 << (i + j);
     }
   }
 }
