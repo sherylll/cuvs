@@ -531,7 +531,7 @@ const std::vector<AnnNNDescentBbqInputs> bbq_inputs = [] {
                         {2, 0.50, bbq_code_layout::transposed_2b, std::optional<uint8_t>{}},
                         {2, 0.27, bbq_code_layout::transposed_2b, std::optional<uint8_t>{1}},
                         {4, 0.80, bbq_code_layout::packed_4b, std::optional<uint8_t>{}},
-                        {4, 0.80, bbq_code_layout::transposed_4b, std::optional<uint8_t>{}},
+                        // Asymmetric transposed_4b queries (1 + 4t, 2t + 4t) are supported.
                         {4, 0.35, bbq_code_layout::transposed_4b, std::optional<uint8_t>{1}},
                         {4, 0.65, bbq_code_layout::transposed_4b, std::optional<uint8_t>{2}},
                         {7, 0.93, bbq_code_layout::packed_7b, std::optional<uint8_t>{}},

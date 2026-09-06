@@ -1025,8 +1025,13 @@ __device__ __forceinline__ void bbq_code_inner_product_2x1(const uint8_t* row_a0
   if constexpr (SelfJoin && DocumentLayout == bbq_layout::packed_4b) {
     bbq::code_inner_product_packed_4b_symmetric_2x1<DocumentRowBytes>(
       row_a0, row_a1, row_b, total0, total1);
-  } else if constexpr (SelfJoin && DocumentLayout == bbq_layout::packed_8b) {
-    bbq::code_inner_product_packed_8b_2x1<DocumentRowBytes>(row_a0, row_a1, row_b, total0, total1);
+  } else if constexpr (SelfJoin && (DocumentLayout == bbq_layout::packed_8b ||
+                                    DocumentLayout == bbq_layout::packed_7b)) {
+    // packed_7b is packed_8b with the top bit masked off, matching code_inner_product's
+    // (1 << bits) - 1 mask for the same two layouts.
+    constexpr uint8_t code_mask = DocumentLayout == bbq_layout::packed_7b ? 0x7Fu : 0xFFu;
+    bbq::code_inner_product_packed_8b_2x1<DocumentRowBytes>(
+      row_a0, row_a1, row_b, total0, total1, code_mask);
   } else {
     bbq::
       code_inner_product_planes_2x1<DocumentPlanes, QueryPlanes, DocumentRowBytes, QueryRowBytes>(
@@ -1142,7 +1147,16 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
 
   // Each plane gets an equal slice of the row in shared memory, so the cached bytes always form a
   // valid encoded chunk.
-  const int plane_bytes          = raft::ceildiv(static_cast<int>(dataset_document.dim()), 8);
+  // Bytes per plane = encoded row length / plane count. Do NOT assume ceildiv(dim, 8): that is
+  // bytes-per-plane only for the bit-plane layouts (packed_1b, transposed_2b, transposed_4b),
+  // where it happens to equal encoded/planes for all three. The dense byte layouts
+  // (packed_7b/packed_8b) are `dim` bytes in one plane, and would read 1/8 of each row.
+  const int plane_bytes =
+    static_cast<int>(cuvs::preprocessing::quantize::bbq::get_encoded_row_length(dataset_document)) /
+    document_planes;
+  assert(plane_bytes == static_cast<int>(cuvs::preprocessing::quantize::bbq::get_encoded_row_length(
+                          dataset_query)) /
+                          query_planes);
   constexpr int query_plane_tile = QUERY_ROW_BYTES / query_planes;
   constexpr int plane_tile       = query_plane_tile;
   constexpr int doc_row_bytes    = query_plane_tile * document_planes;
@@ -2610,6 +2624,16 @@ void GNND<Data_t, Index_t>::local_join(cudaStream_t stream,
       case L::packed_4b:
         launch(std::integral_constant<L, L::packed_4b>{},
                std::integral_constant<L, L::packed_4b>{},
+               std::true_type{});
+        break;
+      case L::packed_7b:
+        launch(std::integral_constant<L, L::packed_7b>{},
+               std::integral_constant<L, L::packed_7b>{},
+               std::true_type{});
+        break;
+      case L::packed_8b:
+        launch(std::integral_constant<L, L::packed_8b>{},
+               std::integral_constant<L, L::packed_8b>{},
                std::true_type{});
         break;
       default: RAFT_FAIL("Unsupported BBQ layout for symmetric local join on this branch.");
