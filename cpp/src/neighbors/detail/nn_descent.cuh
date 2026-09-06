@@ -1147,6 +1147,11 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
   constexpr int plane_tile       = query_plane_tile;
   constexpr int doc_row_bytes    = query_plane_tile * document_planes;
   static_assert(plane_tile % 4 == 0, "plane_tile must be 4-byte aligned for uint32 loads");
+  // Row strides too: rows are indexed as base + idx * stride and then read as uint32_t, so a
+  // stride that is not a multiple of 4 misaligns every odd row. Derived from QUERY_ROW_BYTES, so
+  // this is what catches an ill-chosen QUERY_ROW_BYTES rather than letting it fault at runtime.
+  static_assert((doc_row_bytes + DOC_PAD) % alignof(uint32_t) == 0,
+                "document row stride must be 4-byte aligned for uint32 loads");
   static_assert(
     doc_row_bytes % document_planes == 0 && doc_row_bytes / document_planes == query_plane_tile,
     "document plane stride must match query plane stride");

@@ -12,6 +12,7 @@
 
 #include <raft/core/device_mdspan.hpp>
 
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 
@@ -73,54 +74,40 @@ __device__ __forceinline__ uint32_t get_code(
 }
 #endif
 
-__device__ __forceinline__ uint32_t code_inner_product_binary(const uint8_t* row_a,
-                                                              const uint8_t* row_b,
-                                                              size_t n_bytes,
-                                                              uint32_t result = 0)
+/**
+ * Cross-plane binary inner product over `Planes` bit planes, shifting each (i, j) plane pair by
+ * i + j. `Planes == 1` is a plain binary product, so this covers packed_1b as well as the
+ * transposed layouts. The 4-byte body needs both rows 4-byte aligned; the byte tail handles a
+ * stripe whose length is not a multiple of 4.
+ */
+template <int Planes>
+__device__ __forceinline__ uint32_t code_inner_product_transposed(const uint8_t* row_a,
+                                                                  const uint8_t* row_b,
+                                                                  size_t n_bytes,
+                                                                  uint32_t result = 0)
 {
-  size_t i       = 0;
-  for (; i + 16 <= n_bytes; i += 16) {
-    uint4 a, b;
-    memcpy(&a, row_a + i, 16);
-    memcpy(&b, row_b + i, 16);
-    result += __popc(a.x & b.x) + __popc(a.y & b.y) + __popc(a.z & b.z) + __popc(a.w & b.w);
-  }
-  for (; i + 4 <= n_bytes; i += 4) {
-    uint32_t a, b;
-    memcpy(&a, row_a + i, 4);
-    memcpy(&b, row_b + i, 4);
-    result += __popc(a & b);
-  }
-  for (; i < n_bytes; ++i) {
-    result += __popc(static_cast<unsigned>(row_a[i] & row_b[i]));
-  }
-  return result;
-}
-
-__device__ __forceinline__ uint32_t code_inner_product_transposed_2b_symmetric(const uint8_t* a,
-                                                                               const uint8_t* b,
-                                                                               size_t n_bytes,
-                                                                               uint32_t result = 0)
-{
-  const size_t stripe_size = n_bytes / 2;
-  for (int i = 0; i < 2; ++i)
-    for (int j = 0; j < 2; ++j)
-      result += code_inner_product_binary(a + i * stripe_size, b + j * stripe_size, stripe_size)
-                << (i + j);
-  return result;
-}
-
-__device__ __forceinline__ uint32_t code_inner_product_transposed_4b_symmetric(const uint8_t* row_a,
-                                                                               const uint8_t* row_b,
-                                                                               size_t n_bytes,
-                                                                               uint32_t result = 0)
-{
-  const size_t stripe_size = n_bytes / 4;
-  for (int i = 0; i < 4; ++i) {
-    for (int j = 0; j < 4; ++j) {
-      result +=
-        code_inner_product_binary(row_a + i * stripe_size, row_b + j * stripe_size, stripe_size)
-        << (i + j);
+  const size_t stripe = n_bytes / Planes;
+  // Plane p starts at row + p * stripe and is read as uint32_t words, so a stripe that is not a
+  // multiple of 4 misaligns every plane past the first -- the byte tail below only covers a ragged
+  // stripe *length*, not a ragged stripe *offset*. Planes == 1 has no offset and so is exempt.
+  assert(Planes == 1 || stripe % sizeof(uint32_t) == 0);
+#pragma unroll
+  for (int i = 0; i < Planes; ++i) {
+#pragma unroll
+    for (int j = 0; j < Planes; ++j) {
+      const uint8_t* a = row_a + i * stripe;
+      const uint8_t* b = row_b + j * stripe;
+      uint32_t partial = 0;
+      size_t k         = 0;
+#pragma unroll 4
+      for (; k + sizeof(uint32_t) <= stripe; k += sizeof(uint32_t)) {
+        partial += __popc(*reinterpret_cast<const uint32_t*>(a + k) &
+                          *reinterpret_cast<const uint32_t*>(b + k));
+      }
+      for (; k < stripe; ++k) {
+        partial += __popc(static_cast<unsigned>(a[k] & b[k]));
+      }
+      result += partial << (i + j);
     }
   }
   return result;
@@ -187,13 +174,13 @@ __device__ __forceinline__ uint32_t code_inner_product(const uint8_t* row_a,
 {
   switch (layout) {
     case bbq_code_layout::packed_1b:
-      return code_inner_product_binary(row_a, row_b, n_bytes, result);
+      return code_inner_product_transposed<1>(row_a, row_b, n_bytes, result);
     case bbq_code_layout::transposed_2b:
-      return code_inner_product_transposed_2b_symmetric(row_a, row_b, n_bytes, result);
+      return code_inner_product_transposed<2>(row_a, row_b, n_bytes, result);
     case bbq_code_layout::packed_4b:
       return code_inner_product_packed_4b_symmetric(row_a, row_b, n_bytes, result);
     case bbq_code_layout::transposed_4b:
-      return code_inner_product_transposed_4b_symmetric(row_a, row_b, n_bytes, result);
+      return code_inner_product_transposed<4>(row_a, row_b, n_bytes, result);
     case bbq_code_layout::packed_8b:
       return code_inner_product_packed_8b(row_a, row_b, n_bytes, result);
     case bbq_code_layout::packed_7b:
@@ -339,7 +326,7 @@ code_inner_product_asymmetric_1_vs_4(const uint8_t* codes_document,
 {
   int64_t result = 0;
   for (int i = 0; i < 4; ++i) {
-    result += code_inner_product_binary(codes_document, codes_query + i * stripe_size, stripe_size)
+    result += code_inner_product_transposed<1>(codes_document, codes_query + i * stripe_size, stripe_size)
               << i;
   }
   return result;
@@ -361,8 +348,9 @@ __device__ __forceinline__ int64_t code_inner_product_asymmetric_1_vs_2(
   const uint8_t* codes_document, const uint8_t* codes_query, size_t n_bytes)
 {
   int stripe_size = n_bytes / 2;
-  auto res0       = code_inner_product_binary(codes_document, codes_query, stripe_size);
-  auto res1 = code_inner_product_binary(codes_document, codes_query + stripe_size, stripe_size);
+  auto res0 = code_inner_product_transposed<1>(codes_document, codes_query, stripe_size);
+  auto res1 =
+    code_inner_product_transposed<1>(codes_document, codes_query + stripe_size, stripe_size);
   return res0 + (res1 << 1);
 }
 

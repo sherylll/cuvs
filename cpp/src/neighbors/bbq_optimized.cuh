@@ -17,25 +17,6 @@ namespace preprocessing::quantize::bbq {
 
 #ifdef __CUDACC__
 
-/** Two binary inner products with a shared right operand. */
-template <size_t n_bytes>
-__device__ inline void code_inner_product_binary_2x1(const uint8_t* row_a0,
-                                                     const uint8_t* row_a1,
-                                                     const uint8_t* row_b,
-                                                     uint32_t& total0,
-                                                     uint32_t& total1)
-{
-  static_assert(n_bytes % sizeof(uint32_t) == 0);
-#pragma unroll 4
-  for (size_t i = 0; i < n_bytes; i += sizeof(uint32_t)) {
-    const auto a0 = *reinterpret_cast<const uint32_t*>(row_a0 + i);
-    const auto a1 = *reinterpret_cast<const uint32_t*>(row_a1 + i);
-    const auto b  = *reinterpret_cast<const uint32_t*>(row_b + i);
-    total0 += __popc(a0 & b);
-    total1 += __popc(a1 & b);
-  }
-}
-
 /**
  * Two cross-plane inner products over statically known document and query plane counts.
  * Not asymmetric-specific: a symmetric pair is just document_planes == query_planes, which is how
@@ -51,18 +32,27 @@ __device__ inline void code_inner_product_planes_2x1(const uint8_t* row_a0,
 {
   constexpr size_t document_plane_stride = document_row_bytes / document_planes;
   constexpr size_t query_plane_stride    = query_row_bytes / query_planes;
+  // Both operands are stepped by their own plane stride and then read as uint32_t, so both
+  // strides -- not just the query's -- must be 4-byte aligned.
   static_assert(query_plane_stride % sizeof(uint32_t) == 0);
+  static_assert(document_plane_stride % sizeof(uint32_t) == 0);
 #pragma unroll
   for (int p_query = 0; p_query < query_planes; ++p_query) {
 #pragma unroll
     for (int p_document = 0; p_document < document_planes; ++p_document) {
+      const uint8_t* a0 = row_a0 + p_document * document_plane_stride;
+      const uint8_t* a1 = row_a1 + p_document * document_plane_stride;
+      const uint8_t* b  = row_b + p_query * query_plane_stride;
       uint32_t partial0 = 0;
       uint32_t partial1 = 0;
-      code_inner_product_binary_2x1<query_plane_stride>(row_a0 + p_document * document_plane_stride,
-                                                        row_a1 + p_document * document_plane_stride,
-                                                        row_b + p_query * query_plane_stride,
-                                                        partial0,
-                                                        partial1);
+#pragma unroll 4
+      for (size_t i = 0; i < query_plane_stride; i += sizeof(uint32_t)) {
+        const auto wa0 = *reinterpret_cast<const uint32_t*>(a0 + i);
+        const auto wa1 = *reinterpret_cast<const uint32_t*>(a1 + i);
+        const auto wb  = *reinterpret_cast<const uint32_t*>(b + i);
+        partial0 += __popc(wa0 & wb);
+        partial1 += __popc(wa1 & wb);
+      }
       total0 += partial0 << (p_document + p_query);
       total1 += partial1 << (p_document + p_query);
     }
