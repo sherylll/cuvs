@@ -25,13 +25,13 @@ _RAFT_HOST_DEVICE constexpr uint32_t get_encoded_row_length(const bbq_code_layou
                                                             const uint32_t dim)
 {
   switch (layout) {
-    case bbq_code_layout::single_bit: return (dim * bits + 7) / 8;
-    case bbq_code_layout::dibit: return bits * ((dim + 7) / 8);
-    case bbq_code_layout::packed_nibble: return (dim + 1) / 2;
-    case bbq_code_layout::packed_dibit: return (dim + 3) / 4;
-    case bbq_code_layout::transpose_half_byte: return 4 * ((dim + 7) / 8);
-    case bbq_code_layout::seven_bit: return dim;
-    case bbq_code_layout::unsigned_byte: return dim;
+    case bbq_code_layout::packed_1b: return (dim * bits + 7) / 8;
+    case bbq_code_layout::transposed_2b: return bits * ((dim + 7) / 8);
+    case bbq_code_layout::packed_4b: return (dim + 1) / 2;
+    case bbq_code_layout::packed_2b: return (dim + 3) / 4;
+    case bbq_code_layout::transposed_4b: return 4 * ((dim + 7) / 8);
+    case bbq_code_layout::packed_7b: return dim;
+    case bbq_code_layout::packed_8b: return dim;
   }
   return 0;
 }
@@ -48,9 +48,9 @@ __device__ __forceinline__ uint32_t get_code(
   const uint8_t* row, size_t d, const bbq_code_layout layout, const uint32_t bits, const size_t dim)
 {
   const uint32_t mask = (uint32_t{1} << bits) - 1;
-  if (layout == bbq_code_layout::seven_bit || layout == bbq_code_layout::unsigned_byte) {
+  if (layout == bbq_code_layout::packed_7b || layout == bbq_code_layout::packed_8b) {
     return row[d] & mask;
-  } else if (layout == bbq_code_layout::packed_nibble) {
+  } else if (layout == bbq_code_layout::packed_4b) {
     // Lucene unpackNibbles: high nibble = dims [0, half), low = [half, dim)
     const size_t half = dim / 2;
     if (d < half) {
@@ -58,7 +58,7 @@ __device__ __forceinline__ uint32_t get_code(
     } else {
       return row[d - half] & 0x0Fu;
     }
-  } else if (layout == bbq_code_layout::dibit || layout == bbq_code_layout::transpose_half_byte) {
+  } else if (layout == bbq_code_layout::transposed_2b || layout == bbq_code_layout::transposed_4b) {
     const size_t stripe_size = (dim + 7) / 8;
     uint32_t code            = 0;
     for (uint32_t bit = 0; bit < bits; ++bit) {
@@ -66,7 +66,7 @@ __device__ __forceinline__ uint32_t get_code(
       code |= static_cast<uint32_t>((byte >> (7 - d % 8)) & 1u) << bit;
     }
     return code;
-  } else {  // code_layout::single_bit
+  } else {  // code_layout::packed_1b
     const size_t position = d * bits;
     return static_cast<uint32_t>((row[position / 8] >> (7 - position % 8)) & 1u);
   }
@@ -97,10 +97,10 @@ __device__ __forceinline__ uint32_t code_inner_product_binary(const uint8_t* row
   return result;
 }
 
-__device__ __forceinline__ uint32_t code_inner_product_dibit_symmetric(const uint8_t* a,
-                                                                       const uint8_t* b,
-                                                                       size_t n_bytes,
-                                                                       uint32_t result = 0)
+__device__ __forceinline__ uint32_t code_inner_product_transposed_2b_symmetric(const uint8_t* a,
+                                                                               const uint8_t* b,
+                                                                               size_t n_bytes,
+                                                                               uint32_t result = 0)
 {
   const size_t stripe_size = n_bytes / 2;
   for (int i = 0; i < 2; ++i)
@@ -110,8 +110,10 @@ __device__ __forceinline__ uint32_t code_inner_product_dibit_symmetric(const uin
   return result;
 }
 
-__device__ __forceinline__ uint32_t code_inner_product_int4_transposeHalfByte_symmetric(
-  const uint8_t* row_a, const uint8_t* row_b, size_t n_bytes, uint32_t result = 0)
+__device__ __forceinline__ uint32_t code_inner_product_transposed_4b_symmetric(const uint8_t* row_a,
+                                                                               const uint8_t* row_b,
+                                                                               size_t n_bytes,
+                                                                               uint32_t result = 0)
 {
   const size_t stripe_size = n_bytes / 4;
   for (int i = 0; i < 4; ++i) {
@@ -125,8 +127,10 @@ __device__ __forceinline__ uint32_t code_inner_product_int4_transposeHalfByte_sy
 }
 
 /** Symmetric for packNibbles (Lucene int4DotProductBothPacked). */
-__device__ __forceinline__ uint32_t code_inner_product_int4_packed_nibble_symmetric(
-  const uint8_t* row_a, const uint8_t* row_b, size_t n_bytes, uint32_t total = 0)
+__device__ __forceinline__ uint32_t code_inner_product_packed_4b_symmetric(const uint8_t* row_a,
+                                                                           const uint8_t* row_b,
+                                                                           size_t n_bytes,
+                                                                           uint32_t total = 0)
 {
   constexpr uint32_t nibble_mask = 0x0F0F0F0Fu;
   size_t i                       = 0;
@@ -147,11 +151,11 @@ __device__ __forceinline__ uint32_t code_inner_product_int4_packed_nibble_symmet
 }
 
 /** One-byte-per-code dot product, optionally masking unused high bits. */
-__device__ __forceinline__ uint32_t code_inner_product_unsigned_byte(const uint8_t* row_a,
-                                                                     const uint8_t* row_b,
-                                                                     size_t n_bytes,
-                                                                     uint32_t result   = 0,
-                                                                     uint8_t code_mask = 0xFFu)
+__device__ __forceinline__ uint32_t code_inner_product_packed_8b(const uint8_t* row_a,
+                                                                 const uint8_t* row_b,
+                                                                 size_t n_bytes,
+                                                                 uint32_t result   = 0,
+                                                                 uint8_t code_mask = 0xFFu)
 {
   const uint32_t word_mask = uint32_t{code_mask} * 0x01010101u;
   size_t i       = 0;
@@ -172,7 +176,7 @@ __device__ __forceinline__ uint32_t code_inner_product_unsigned_byte(const uint8
  * Integer inner product between two encoded rows.
  *
  * The uint32_t result bounds every BBQ layout to 66,050 dimensions: the worst case is
- * `unsigned_byte`, where `dim * 255 * 255` must not exceed UINT32_MAX.
+ * `packed_8b`, where `dim * 255 * 255` must not exceed UINT32_MAX.
  */
 __device__ __forceinline__ uint32_t code_inner_product(const uint8_t* row_a,
                                                        const uint8_t* row_b,
@@ -182,19 +186,19 @@ __device__ __forceinline__ uint32_t code_inner_product(const uint8_t* row_a,
                                                        uint32_t result = 0)
 {
   switch (layout) {
-    case bbq_code_layout::single_bit:
+    case bbq_code_layout::packed_1b:
       return code_inner_product_binary(row_a, row_b, n_bytes, result);
-    case bbq_code_layout::dibit:
-      return code_inner_product_dibit_symmetric(row_a, row_b, n_bytes, result);
-    case bbq_code_layout::packed_nibble:
-      return code_inner_product_int4_packed_nibble_symmetric(row_a, row_b, n_bytes, result);
-    case bbq_code_layout::transpose_half_byte:
-      return code_inner_product_int4_transposeHalfByte_symmetric(row_a, row_b, n_bytes, result);
-    case bbq_code_layout::unsigned_byte:
-      return code_inner_product_unsigned_byte(row_a, row_b, n_bytes, result);
-    case bbq_code_layout::seven_bit:
+    case bbq_code_layout::transposed_2b:
+      return code_inner_product_transposed_2b_symmetric(row_a, row_b, n_bytes, result);
+    case bbq_code_layout::packed_4b:
+      return code_inner_product_packed_4b_symmetric(row_a, row_b, n_bytes, result);
+    case bbq_code_layout::transposed_4b:
+      return code_inner_product_transposed_4b_symmetric(row_a, row_b, n_bytes, result);
+    case bbq_code_layout::packed_8b:
+      return code_inner_product_packed_8b(row_a, row_b, n_bytes, result);
+    case bbq_code_layout::packed_7b:
     default:
-      return code_inner_product_unsigned_byte(
+      return code_inner_product_packed_8b(
         row_a, row_b, n_bytes, result, static_cast<uint8_t>((uint32_t{1} << bits) - 1));
   }
 }
@@ -369,15 +373,15 @@ code_inner_product_asymmetric(const uint8_t* codes_document,
                               const bbq_code_layout layout_query,
                               const size_t n_bytes_query)
 {
-  if (layout_dataset == bbq_code_layout::single_bit &&
-      layout_query == bbq_code_layout::transpose_half_byte) {
+  if (layout_dataset == bbq_code_layout::packed_1b &&
+      layout_query == bbq_code_layout::transposed_4b) {
     return code_inner_product_asymmetric_1_vs_4(
       codes_document, codes_query, n_bytes_query, n_bytes_query / 4);
-  } else if (layout_dataset == bbq_code_layout::single_bit &&
-             layout_query == bbq_code_layout::dibit) {
+  } else if (layout_dataset == bbq_code_layout::packed_1b &&
+             layout_query == bbq_code_layout::transposed_2b) {
     return code_inner_product_asymmetric_1_vs_2(codes_document, codes_query, n_bytes_query);
-  } else if (layout_dataset == bbq_code_layout::dibit &&
-             layout_query == bbq_code_layout::transpose_half_byte) {
+  } else if (layout_dataset == bbq_code_layout::transposed_2b &&
+             layout_query == bbq_code_layout::transposed_4b) {
     return code_inner_product_asymmetric_2_vs_4(codes_document, codes_query, n_bytes_query);
   } else {
     return -1;  // Unsupported layouts

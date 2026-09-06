@@ -28,32 +28,32 @@ namespace preprocessing::quantize::bbq {
 /**
  * Storage layout of BBQ/OSQ quantized component codes in each dataset row.
  *
- * `single_bit` Binary-packed bitstream (packAsBinary). Used for bits == 1.
- * `dibit` matches Lucene's transposeDibit. Used for bits == 2.
- * `unsigned_byte` one uint8_t per component. Used for bits == 7 and 8.
+ * `packed_1b` Binary-packed bitstream (packAsBinary). Used for bits == 1.
+ * `transposed_2b` matches Lucene's transposeDibit. Used for bits == 2.
+ * `packed_8b` one uint8_t per component. Used for bits == 7 and 8.
  */
 enum class bbq_code_layout {
-  single_bit, /** Each dimension is quantized to a single bit and packed into bytes. Reflects
-               * OptimizedScalarQuantizer.packAsBinary. During query time, the query vector is
-               * quantized to 4 bits per dimension. */
-  dibit,      /** Each dimension is quantized to 2 bits (dibit) and packed into bytes. Reflects
-               * OptimizedScalarQuantizer.transposeDibit. During query time, the query vector is
-               * quantized to 4 bits per dimension. */
-  transpose_half_byte, /** Each dimension is quantized to 4 bits, optimized for bitwise operations.
-                        * Reflects OptimizedScalarQuantizer.transposeHalfByte. the first bit of
-                        * every dimension is in the first set dimensions bits, or (dimensions/8)
-                        * bytes. The second, third, and fourth bits are in the second, third, and
-                        * fourth set of dimensions bits, respectively. Format used for queries. */
-  packed_nibble, /** Each dimension is quantized to 4 bits, two values are packed into each output
+  packed_1b,     /** Each dimension is quantized to a single bit and packed into bytes. Reflects
+                  * OptimizedScalarQuantizer.packAsBinary. During query time, the query vector is
+                  * quantized to 4 bits per dimension. */
+  transposed_2b, /** Each dimension is quantized to 2 bits, stored as 2 bitplanes.
+                  * Reflects OptimizedScalarQuantizer.transposeDibit. During query time, the query
+                  * vector is quantized to 4 bits per dimension. */
+  transposed_4b, /** Each dimension is quantized to 4 bits, optimized for bitwise operations.
+                  * Reflects OptimizedScalarQuantizer.transposeHalfByte. the first bit of
+                  * every dimension is in the first set dimensions bits, or (dimensions/8)
+                  * bytes. The second, third, and fourth bits are in the second, third, and
+                  * fourth set of dimensions bits, respectively. Format used for queries. */
+  packed_4b,     /** Each dimension is quantized to 4 bits, two values are packed into each output
                   * byte. Reflects OffHeapScalarQuantizedVectorValues.packNibbles. */
-  packed_dibit,  /** Each dimension is quantized to 2 bits, four values (from consecutive
+  packed_2b,     /** Each dimension is quantized to 2 bits, four values (from consecutive
                   * dimensions) are packed into each output byte -- the 2-bit analogue of
-                  * packed_nibble's contiguous packing. Densely stored (4x smaller than storing
-                  * the same 2-bit codes in packed_nibble's nibble-width slots); a bits=2
-                  * document in this layout must be promoted to nibble width before an int4 MMA
-                  * against a packed_nibble query. */
-  seven_bit,     /** Each dimension is quantized to 7 bits and treated as a signed value. */
-  unsigned_byte, /** Each dimension is quantized to 8 bits and treated as an unsigned value. */
+                  * packed_4b's contiguous packing. Densely stored (4x smaller than storing
+                  * the same 2-bit codes in packed_4b's 4-bit-width slots); a bits=2
+                  * document in this layout must be promoted to 4-bit width before an int4 MMA
+                  * against a packed_4b query. */
+  packed_7b,     /** Each dimension is quantized to 7 bits and treated as a signed value. */
+  packed_8b,     /** Each dimension is quantized to 8 bits and treated as an unsigned value. */
 
 };
 template <typename DataT, typename IdxT, typename Accessor>
@@ -70,7 +70,7 @@ struct bbq_quantizer {
   dense_owning_vector<DataT, IdxT, Accessor> centroid;
 
   uint32_t bits{};
-  bbq_code_layout layout{bbq_code_layout::single_bit};
+  bbq_code_layout layout{bbq_code_layout::packed_1b};
   cuvs::distance::DistanceType metric{cuvs::distance::DistanceType::L2Expanded};
   float centroid_norm_sq{};
 
@@ -114,13 +114,13 @@ struct bbq_quantizer {
   {
     auto const d = dim();
     switch (layout) {
-      case bbq_code_layout::single_bit: return (d * bits + 7) / 8;
-      case bbq_code_layout::dibit: return bits * ((d + 7) / 8);
-      case bbq_code_layout::packed_nibble: return (d + 1) / 2;
-      case bbq_code_layout::packed_dibit: return (d + 3) / 4;
-      case bbq_code_layout::seven_bit: return d;
-      case bbq_code_layout::unsigned_byte: return d;
-      case bbq_code_layout::transpose_half_byte: return 4 * ((d + 7) / 8);
+      case bbq_code_layout::packed_1b: return (d * bits + 7) / 8;
+      case bbq_code_layout::transposed_2b: return bits * ((d + 7) / 8);
+      case bbq_code_layout::packed_4b: return (d + 1) / 2;
+      case bbq_code_layout::packed_2b: return (d + 3) / 4;
+      case bbq_code_layout::packed_7b: return d;
+      case bbq_code_layout::packed_8b: return d;
+      case bbq_code_layout::transposed_4b: return 4 * ((d + 7) / 8);
     }
     return 0;
   }
@@ -143,7 +143,7 @@ struct bbq_quantizer_view {
   dense_view_vector<const DataT, IdxT, Accessor> centroid;
 
   uint32_t bits{};
-  bbq_code_layout layout{bbq_code_layout::single_bit};
+  bbq_code_layout layout{bbq_code_layout::packed_1b};
   cuvs::distance::DistanceType metric{cuvs::distance::DistanceType::L2Expanded};
   float centroid_norm_sq{};
 

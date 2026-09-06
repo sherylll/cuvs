@@ -38,11 +38,11 @@ __device__ inline void code_inner_product_binary_2x1(const uint8_t* row_a0,
 
 /** Two two-bit transposed inner products with a shared right operand. */
 template <size_t n_bytes>
-__device__ inline void code_inner_product_dibit_symmetric_2x1(const uint8_t* row_a0,
-                                                              const uint8_t* row_a1,
-                                                              const uint8_t* row_b,
-                                                              uint32_t& total0,
-                                                              uint32_t& total1)
+__device__ inline void code_inner_product_transposed_2b_symmetric_2x1(const uint8_t* row_a0,
+                                                                      const uint8_t* row_a1,
+                                                                      const uint8_t* row_b,
+                                                                      uint32_t& total0,
+                                                                      uint32_t& total1)
 {
   static_assert(n_bytes % (2 * sizeof(uint32_t)) == 0);
   const size_t stripe_size = n_bytes / 2;
@@ -63,12 +63,11 @@ __device__ inline void code_inner_product_dibit_symmetric_2x1(const uint8_t* row
 
 /** Two four-bit transposed inner products with a shared right operand. */
 template <size_t n_bytes>
-__device__ inline void code_inner_product_int4_transposeHalfByte_symmetric_2x1(
-  const uint8_t* row_a0,
-  const uint8_t* row_a1,
-  const uint8_t* row_b,
-  uint32_t& total0,
-  uint32_t& total1)
+__device__ inline void code_inner_product_transposed_4b_symmetric_2x1(const uint8_t* row_a0,
+                                                                      const uint8_t* row_a1,
+                                                                      const uint8_t* row_b,
+                                                                      uint32_t& total0,
+                                                                      uint32_t& total1)
 {
   static_assert(n_bytes % (4 * sizeof(uint32_t)) == 0);
   const size_t stripe_size = n_bytes / 4;
@@ -87,13 +86,13 @@ __device__ inline void code_inner_product_int4_transposeHalfByte_symmetric_2x1(
   }
 }
 
-/** Two packed-nibble inner products with a shared right operand. */
+/** Two packed 4-bit inner products with a shared right operand. */
 template <size_t n_bytes>
-__device__ inline void code_inner_product_int4_packed_nibble_symmetric_2x1(const uint8_t* row_a0,
-                                                                           const uint8_t* row_a1,
-                                                                           const uint8_t* row_b,
-                                                                           uint32_t& total0,
-                                                                           uint32_t& total1)
+__device__ inline void code_inner_product_packed_4b_symmetric_2x1(const uint8_t* row_a0,
+                                                                  const uint8_t* row_a1,
+                                                                  const uint8_t* row_b,
+                                                                  uint32_t& total0,
+                                                                  uint32_t& total1)
 {
   static_assert(n_bytes % sizeof(uint32_t) == 0);
   constexpr uint32_t nibble_mask = 0x0F0F0F0Fu;
@@ -113,12 +112,12 @@ __device__ inline void code_inner_product_int4_packed_nibble_symmetric_2x1(const
 
 /** Two one-byte-per-code inner products with a shared right operand. */
 template <size_t n_bytes>
-__device__ inline void code_inner_product_unsigned_byte_2x1(const uint8_t* row_a0,
-                                                            const uint8_t* row_a1,
-                                                            const uint8_t* row_b,
-                                                            uint32_t& total0,
-                                                            uint32_t& total1,
-                                                            uint8_t code_mask = 0xFFu)
+__device__ inline void code_inner_product_packed_8b_2x1(const uint8_t* row_a0,
+                                                        const uint8_t* row_a1,
+                                                        const uint8_t* row_b,
+                                                        uint32_t& total0,
+                                                        uint32_t& total1,
+                                                        uint8_t code_mask = 0xFFu)
 {
   static_assert(n_bytes % sizeof(uint32_t) == 0);
   const uint32_t word_mask = uint32_t{code_mask} * 0x01010101u;
