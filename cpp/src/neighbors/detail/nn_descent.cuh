@@ -16,7 +16,9 @@
 #include <cuvs/neighbors/nn_descent.hpp>
 #include <cuvs/preprocessing/quantize/bbq.hpp>
 
+#include <cub/cub.cuh>
 #include <raft/core/copy.cuh>
+
 #include <raft/core/device_mdarray.hpp>
 #include <raft/core/device_mdspan.hpp>
 #include <raft/core/error.hpp>
@@ -214,6 +216,10 @@ constexpr int NUM_SAMPLES = 32;
 constexpr int MAX_NUM_BI_SAMPLES        = 64;
 constexpr int SKEWED_MAX_NUM_BI_SAMPLES = skew_dim<float>(MAX_NUM_BI_SAMPLES);
 constexpr int BLOCK_SIZE                = 512;
+constexpr int MERGE_BLOCK_SIZE          = 128;  // deferred-insert merge: one warp per row
+// Rows are joined a tile at a time so the candidate buffer scales with the tile, not with nrow.
+// Targets still scatter graph-wide, so the merge and the seg_* arrays stay nrow-sized.
+constexpr int LOCAL_JOIN_TILE_ROWS      = 128 * 1024;
 constexpr int WMMA_M                    = 16;
 constexpr int WMMA_N                    = 16;
 constexpr int WMMA_K                    = 16;
@@ -425,6 +431,147 @@ __device__ void insert_to_global_graph(ResultItem<Index_t> elem,
       if (loop_flag && lane_id == 0) { atomicExch(&locks[list_id * num_segments + segment_id], 0); }
     }
   } while (!loop_flag);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Deferred insert. local_join appends candidates to a flat array instead of taking the per-list
+// lock; they are then grouped by target (radix sort + run-length encode) and folded into the graph
+// by merge_candidates_kernel. One warp owns one target row there, so it needs no lock, no fence
+// and no atomic.
+// ---------------------------------------------------------------------------------------------
+
+// Candidate payload packed into 8 B so the radix sort can carry it as its value.
+__device__ __forceinline__ uint64_t pack_candidate(int id_with_flag, DistData_t dist)
+{
+  return (static_cast<uint64_t>(__float_as_uint(dist)) << 32) | static_cast<uint32_t>(id_with_flag);
+}
+
+// Warp-wide compare-exchange against lane^k; `up` picks which side keeps the smaller element.
+template <typename Index_t>
+__device__ __forceinline__ void cand_xchg(ResultItem<Index_t>& e, int k, bool up)
+{
+  ResultItem<Index_t> other;
+  other.id_with_flag() = __shfl_xor_sync(raft::warp_full_mask(), e.id_with_flag(), k);
+  other.dist()         = __shfl_xor_sync(raft::warp_full_mask(), e.dist(), k);
+  if ((e < other) != up) { e = other; }
+}
+
+// Bitonic merge of a 32-element bitonic sequence into ascending order.
+template <typename Index_t>
+__device__ __forceinline__ void cand_bitonic_merge32(ResultItem<Index_t>& e, int lane)
+{
+#pragma unroll
+  for (int k = 16; k >= 1; k >>= 1)
+    cand_xchg(e, k, (lane & k) == 0);
+}
+
+// Bitonic sort of 32 unsorted elements. Ascending=false is what the merge wants for the candidate
+// half: an ascending row followed by a descending chunk is already bitonic, so no reversal needed.
+template <bool Ascending, typename Index_t>
+__device__ __forceinline__ void cand_bitonic_sort32(ResultItem<Index_t>& e, int lane)
+{
+#pragma unroll
+  for (int size = 2; size <= 32; size <<= 1)
+#pragma unroll
+    for (int k = size >> 1; k >= 1; k >>= 1)
+      cand_xchg(e, k, (((lane & size) == 0) == ((lane & k) == 0)) == Ascending);
+}
+
+// One warp per segment. seg_target[s] is the row to update; seg_start[s]/seg_len[s] locate its run
+// in the sorted candidate array. The row stays in registers across chunks, so graph and dists are
+// read and written exactly once.
+template <typename Index_t, typename ID_t = InternalID_t<Index_t>>
+RAFT_KERNEL __launch_bounds__(MERGE_BLOCK_SIZE)
+  merge_candidates_kernel(const Index_t* __restrict__ seg_target,
+                          const int* __restrict__ seg_start,
+                          const int* __restrict__ seg_len,
+                          const int* __restrict__ n_segments,
+                          const uint64_t* __restrict__ cand,
+                          ID_t* graph,
+                          DistData_t* dists,
+                          Index_t nrow)
+{
+  constexpr int WARPS = MERGE_BLOCK_SIZE / 32;
+  // Staged in packed form: ResultItem has a non-trivial default ctor, so it cannot back a
+  // __shared__ array.
+  __shared__ uint64_t s_stage[WARPS][DEGREE_ON_DEVICE];
+
+  const int lane = threadIdx.x % raft::warp_size();
+  const int wid  = threadIdx.x / raft::warp_size();
+  const int seg  = blockIdx.x * WARPS + wid;
+  if (seg >= *n_segments) return;
+
+  // Rejected candidates carry a sentinel target and sort into a trailing run; skipping it here is
+  // what keeps that run from addressing off the end of the graph.
+  const Index_t row = seg_target[seg];
+  if (row < 0 || row >= nrow) return;
+
+  const int total = seg_len[seg];
+  if (total <= 0) return;
+  const int start   = seg_start[seg];
+  const size_t base = static_cast<size_t>(row) * DEGREE_ON_DEVICE;
+
+  ResultItem<Index_t> a;
+  a.id_with_flag() = graph[base + lane].id_with_flag();
+  a.dist()         = dists[base + lane];
+
+  // The sort keys on target only, so a segment's surplus is in arbitrary order -- truncating would
+  // discard good candidates. Fold it in a chunk at a time, carrying the running top-DEGREE.
+  for (int off = 0; off < total; off += raft::warp_size()) {
+    const int cnt = min(total - off, raft::warp_size());
+
+    ResultItem<Index_t> b;  // default-constructs to {INT_MAX, FLT_MAX}, which sorts to the tail
+    if (lane < cnt) {
+      const uint64_t pk = cand[start + off + lane];
+      b.id_with_flag()  = static_cast<Index_t>(static_cast<uint32_t>(pk));
+      b.dist()          = __uint_as_float(static_cast<uint32_t>(pk >> 32));
+    }
+    cand_bitonic_sort32<false>(b, lane);
+
+    // a ++ b is bitonic; the first merge stage compares element i with i+32, which is in-lane.
+    if (!(a < b)) {
+      ResultItem<Index_t> t = a;
+      a                     = b;
+      b                     = t;
+    }
+    cand_bitonic_merge32(a, lane);
+    cand_bitonic_merge32(b, lane);
+
+    // Equal ids imply equal dists, so duplicates are adjacent under the (dist, id) order.
+    const Index_t prev_a = __shfl_up_sync(raft::warp_full_mask(), a.id_with_flag(), 1);
+    const Index_t last_a = __shfl_sync(raft::warp_full_mask(), a.id_with_flag(), 31);
+    const Index_t up_b   = __shfl_up_sync(raft::warp_full_mask(), b.id_with_flag(), 1);
+    ResultItem<Index_t> pa{prev_a, 0.0f}, pb{(lane == 0) ? last_a : up_b, 0.0f};
+    const bool keep_a = (lane == 0) || (a.id() != pa.id());
+    const bool keep_b = (b.id() != pb.id());
+
+    const uint32_t mask_a = __ballot_sync(raft::warp_full_mask(), keep_a);
+    const uint32_t mask_b = __ballot_sync(raft::warp_full_mask(), keep_b);
+    const uint32_t lt     = (1u << lane) - 1u;
+    const int rank_a      = __popc(mask_a & lt);
+    const int rank_b      = __popc(mask_a) + __popc(mask_b & lt);
+
+    // Ranks are unique, so compaction is a shared-memory scatter/gather, not a shuffle scan. The
+    // row always holds DEGREE_ON_DEVICE unique entries, so every slot below it gets written.
+    // Rows can hold fewer than DEGREE_ON_DEVICE distinct entries (empty slots carry an
+    // out-of-range marker, and dedup collapses them), so seed the staging row first -- otherwise an
+    // unwritten rank would be gathered as stale data from the previous chunk.
+    s_stage[wid][lane] =
+      pack_candidate(std::numeric_limits<Index_t>::max(), std::numeric_limits<DistData_t>::max());
+    __syncwarp();
+    if (keep_a && rank_a < DEGREE_ON_DEVICE)
+      s_stage[wid][rank_a] = pack_candidate(a.id_with_flag(), a.dist());
+    if (keep_b && rank_b < DEGREE_ON_DEVICE)
+      s_stage[wid][rank_b] = pack_candidate(b.id_with_flag(), b.dist());
+    __syncwarp();
+    const uint64_t kept = s_stage[wid][lane];
+    a.id_with_flag()    = static_cast<Index_t>(static_cast<uint32_t>(kept));
+    a.dist()            = __uint_as_float(static_cast<uint32_t>(kept >> 32));
+    __syncwarp();
+  }
+
+  graph[base + lane].id_with_flag() = a.id_with_flag();
+  dists[base + lane]                = a.dist();
 }
 
 template <typename Index_t>
@@ -1711,10 +1858,12 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
                              const int width,
                              const device_bbq_quantizer_view<DataT, int64_t> dataset_document,
                              const device_bbq_quantizer_view<DataT, int64_t> dataset_query,
-                             ID_t* graph,
-                             DistData_t* dists,
-                             int graph_width,
-                             int* locks,
+                             Index_t* cand_target,
+                             uint64_t* cand_payload,
+                             int* cand_count,
+                             int cand_capacity,
+                             Index_t row_offset,
+                             Index_t nrow,
                              cuvs::distance::DistanceType metric,
                              DistEpilogue_t dist_epilogue)
 {
@@ -1788,7 +1937,7 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
 
   Index_t* new_neighbors = s_list;
   Index_t* old_neighbors = s_list + MAX_NUM_BI_SAMPLES;
-  const size_t list_id   = blockIdx.x;
+  const size_t list_id   = static_cast<size_t>(blockIdx.x) + row_offset;
   const int2 new_size2   = sizes_new[list_id];
   const int2 old_size2   = sizes_old[list_id];
   int new_size           = new_size2.x + new_size2.y;
@@ -1809,6 +1958,20 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
                        old_size2,
                        new_size,
                        old_size);
+
+  // Reserve this block's candidate slots in one atomic rather than one per candidate: a single
+  // global counter hit once per candidate would serialize on one address. The loop trip counts are
+  // known here, so the slice is exact and every reserved slot is written -- rejected candidates get
+  // a sentinel target so they sort to the tail and their run is ignored.
+  // Phases 2 and 3 are skipped entirely when a block has no old neighbours, so reserving for them
+  // unconditionally would leave those slots unwritten and the sort would read uninitialised memory.
+  __shared__ int s_cand_base;
+  if (threadIdx.x == 0) {
+    const int n_slots = new_size + (old_size > 0 ? new_size + old_size : 0);
+    s_cand_base       = atomicAdd(cand_count, n_slots);
+  }
+  __syncthreads();
+  const int cand_base = s_cand_base;
 
   const int warp_id       = threadIdx.x / raft::warp_size();
   const int lane_id       = threadIdx.x % raft::warp_size();
@@ -1981,8 +2144,16 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
                                  true,
                                  MMA_STORE_STRIDE,
                                  new_size);
-    if (min_elem.id() < gridDim.x) {
-      insert_to_global_graph(min_elem, s_list[idx_in_list], graph, dists, graph_width, locks);
+    // Deferred insert: append rather than lock. Rejections match insert_to_global_graph's --
+    // out-of-range ids, and self-edges (elem.id() == list_id).
+    if ((tx % raft::warp_size()) == 0) {
+      const int slot = cand_base + idx_in_list;
+      if (slot < cand_capacity) {
+        const Index_t tgt  = static_cast<Index_t>(s_list[idx_in_list]);
+        const bool ok      = min_elem.id() < nrow && min_elem.id() != tgt;
+        cand_target[slot]  = ok ? tgt : std::numeric_limits<Index_t>::max();
+        cand_payload[slot] = pack_candidate(min_elem.id_with_flag(), min_elem.dist());
+      }
     }
   }
 
@@ -2002,8 +2173,16 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
                                  true,
                                  MMA_STORE_STRIDE,
                                  old_size);
-    if (min_elem.id() < gridDim.x) {
-      insert_to_global_graph(min_elem, s_list[idx_in_list], graph, dists, graph_width, locks);
+    // Deferred insert: append rather than lock. Rejections match insert_to_global_graph's --
+    // out-of-range ids, and self-edges (elem.id() == list_id).
+    if ((tx % raft::warp_size()) == 0) {
+      const int slot = cand_base + new_size + idx_in_list;
+      if (slot < cand_capacity) {
+        const Index_t tgt  = static_cast<Index_t>(s_list[idx_in_list]);
+        const bool ok      = min_elem.id() < nrow && min_elem.id() != tgt;
+        cand_target[slot]  = ok ? tgt : std::numeric_limits<Index_t>::max();
+        cand_payload[slot] = pack_candidate(min_elem.id_with_flag(), min_elem.dist());
+      }
     }
   }
 
@@ -2013,8 +2192,16 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
     const int list_idx = idx_in_list + MAX_NUM_BI_SAMPLES;
     auto min_elem      = get_min_item(
       s_list[list_idx], idx_in_list, new_neighbors, s_distances, false, MMA_STORE_STRIDE, new_size);
-    if (min_elem.id() < gridDim.x) {
-      insert_to_global_graph(min_elem, s_list[list_idx], graph, dists, graph_width, locks);
+    // Deferred insert: append rather than lock. Rejections match insert_to_global_graph's --
+    // out-of-range ids, and self-edges (elem.id() == list_id).
+    if ((tx % raft::warp_size()) == 0) {
+      const int slot = cand_base + 2 * new_size + idx_in_list;
+      if (slot < cand_capacity) {
+        const Index_t tgt  = static_cast<Index_t>(s_list[list_idx]);
+        const bool ok      = min_elem.id() < nrow && min_elem.id() != tgt;
+        cand_target[slot]  = ok ? tgt : std::numeric_limits<Index_t>::max();
+        cand_payload[slot] = pack_candidate(min_elem.id_with_flag(), min_elem.dist());
+      }
     }
   }
 #endif  // (__CUDA_ARCH__ >= 750)
@@ -2339,6 +2526,19 @@ GNND<Data_t, Index_t>::GNND(raft::resources const& res, const BuildConfig& build
     dists_host_buffer_{
       raft::make_pinned_matrix<DistData_t, size_t, raft::row_major>(res, nrow_, DEGREE_ON_DEVICE)},
     d_locks_{raft::make_device_vector<int, size_t>(res, nrow_)},
+    // Worst case per block is 2 * new_size + old_size, both capped at MAX_NUM_BI_SAMPLES, and only
+    // one tile of rows is in flight at a time.
+    cand_capacity_{std::min<size_t>(nrow_, LOCAL_JOIN_TILE_ROWS) * 3 * MAX_NUM_BI_SAMPLES},
+    cand_target_{raft::make_device_vector<Index_t, size_t>(res, cand_capacity_)},
+    cand_payload_{raft::make_device_vector<uint64_t, size_t>(res, cand_capacity_)},
+    cand_target_sorted_{raft::make_device_vector<Index_t, size_t>(res, cand_capacity_)},
+    cand_payload_sorted_{raft::make_device_vector<uint64_t, size_t>(res, cand_capacity_)},
+    cand_count_{raft::make_device_vector<int, size_t>(res, 1)},
+    seg_target_{raft::make_device_vector<Index_t, size_t>(res, nrow_ + 1)},
+    seg_len_{raft::make_device_vector<int, size_t>(res, nrow_ + 1)},
+    seg_start_{raft::make_device_vector<int, size_t>(res, nrow_ + 1)},
+    seg_num_runs_{raft::make_device_vector<int, size_t>(res, 1)},
+    cub_temp_{raft::make_device_vector<char, size_t>(res, 1)},  // grown on first use
     h_rev_graph_new_{
       raft::make_pinned_matrix<Index_t, size_t, raft::row_major>(res, nrow_, NUM_SAMPLES)},
     h_graph_old_(
@@ -2518,26 +2718,53 @@ void GNND<Data_t, Index_t>::local_join(
                  static_cast<long long>(quantizer_document.dim()));
   }
 
+  // Rows are joined a tile at a time, and each tile's candidates are merged before the next runs.
+  // That bounds the candidate buffer by the tile rather than by nrow, and it restores some of the
+  // immediacy the lock had: tile k joins against the merges of tiles 0..k-1.
+  size_t tile_begin = 0;
+  size_t tile_rows  = 0;
+
   // One launch site for both kernels: they take identical arguments, and the query's layout picks
   // the path -- packed_4b is the only layout the int4 tensor-core kernel is dispatched for.
   auto launch = [&](auto document_layout, auto query_layout, auto self_join_tag) {
     constexpr auto D = decltype(document_layout)::value;
     constexpr auto Q = decltype(query_layout)::value;
     constexpr bool S = decltype(self_join_tag)::value;
-#define CUVS_BBQ_LOCAL_JOIN_ARGS                                                                 \
+#define CUVS_BBQ_LOCAL_JOIN_COMMON                                                               \
   graph_.h_graph_new.data_handle(), h_rev_graph_new_.data_handle(),                              \
     d_list_sizes_new_.data_handle(), h_graph_old_.data_handle(), h_rev_graph_old_.data_handle(), \
-    d_list_sizes_old_.data_handle(), NUM_SAMPLES, quantizer_document, quantizer_query,           \
-    graph_buffer_.data_handle(), dists_buffer_.data_handle(), DEGREE_ON_DEVICE,                  \
-    d_locks_.data_handle(), build_config_.metric, dist_epilogue
+    d_list_sizes_old_.data_handle(), NUM_SAMPLES, quantizer_document, quantizer_query
     if constexpr (Q == L::packed_4b) {
-      local_join_kernel_bbq_wmma<D, Q, S>
-        <<<nrow_, BLOCK_SIZE, 0, stream>>>(CUVS_BBQ_LOCAL_JOIN_ARGS);
+      // Deferred insert: join a tile of rows, then merge its candidates before the next tile.
+      for (tile_begin = 0; tile_begin < nrow_; tile_begin += LOCAL_JOIN_TILE_ROWS) {
+        tile_rows = std::min<size_t>(LOCAL_JOIN_TILE_ROWS, nrow_ - tile_begin);
+        RAFT_CUDA_TRY(cudaMemsetAsync(cand_count_.data_handle(), 0, sizeof(int), stream));
+        local_join_kernel_bbq_wmma<D, Q, S>
+          <<<tile_rows, BLOCK_SIZE, 0, stream>>>(CUVS_BBQ_LOCAL_JOIN_COMMON,
+                                                 cand_target_.data_handle(),
+                                                 cand_payload_.data_handle(),
+                                                 cand_count_.data_handle(),
+                                                 static_cast<int>(cand_capacity_),
+                                                 static_cast<Index_t>(tile_begin),
+                                                 static_cast<Index_t>(nrow_),
+                                                 build_config_.metric,
+                                                 dist_epilogue);
+        RAFT_CUDA_TRY(cudaPeekAtLastError());
+        merge_deferred_candidates(stream);
+      }
     } else {
+      // This path still inserts under the per-list lock, so it needs no tiling and no merge.
       local_join_kernel_bbq_simt<D, Q, S>
-        <<<nrow_, BLOCK_SIZE, 0, stream>>>(CUVS_BBQ_LOCAL_JOIN_ARGS);
+        <<<nrow_, BLOCK_SIZE, 0, stream>>>(CUVS_BBQ_LOCAL_JOIN_COMMON,
+                                           graph_buffer_.data_handle(),
+                                           dists_buffer_.data_handle(),
+                                           DEGREE_ON_DEVICE,
+                                           d_locks_.data_handle(),
+                                           build_config_.metric,
+                                           dist_epilogue);
+      RAFT_CUDA_TRY(cudaPeekAtLastError());
     }
-#undef CUVS_BBQ_LOCAL_JOIN_ARGS
+#undef CUVS_BBQ_LOCAL_JOIN_COMMON
   };
   const L d = quantizer_document.layout;
   const L q = quantizer_query.layout;
@@ -2589,6 +2816,73 @@ void GNND<Data_t, Index_t>::local_join(
   } else {
     RAFT_FAIL("Unsupported BBQ layout pair for asymmetric local join.");
   }
+}
+
+// Group the candidates local_join appended and fold them into the graph: radix sort by target,
+// run-length encode the target column into segments, scan the lengths into offsets, merge.
+template <typename Data_t, typename Index_t>
+void GNND<Data_t, Index_t>::merge_deferred_candidates(cudaStream_t stream)
+{
+  // CUB needs num_items on the host, so the count comes back each iteration. Sorting the full
+  // capacity instead to avoid the sync measured worse: more sort passes, and the host waits here
+  // anyway.
+  int n_cand = 0;
+  raft::copy(&n_cand, cand_count_.data_handle(), 1, stream);
+  RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
+  n_cand = std::min<int>(n_cand, static_cast<int>(cand_capacity_));
+  if (n_cand == 0) return;
+
+  // Targets are < nrow, so only the low bits matter; sorting the full 32 would roughly double the
+  // passes for nothing. Rejected candidates carry Index_t max, so they sort into a trailing run
+  // that the merge skips (its target is out of range, so seg_len is irrelevant -- it is dropped by
+  // the n_segments bound below).
+  int key_bits = 1;
+  while ((1 << key_bits) < static_cast<int>(nrow_))
+    ++key_bits;
+
+  auto* d_tgt     = cand_target_.data_handle();
+  auto* d_pay     = cand_payload_.data_handle();
+  auto* d_tgt_out = cand_target_sorted_.data_handle();
+  auto* d_pay_out = cand_payload_sorted_.data_handle();
+  auto* d_seg_t   = seg_target_.data_handle();
+  auto* d_seg_l   = seg_len_.data_handle();
+  auto* d_seg_s   = seg_start_.data_handle();
+  auto* d_runs    = seg_num_runs_.data_handle();
+
+  size_t sort_bytes = 0, rle_bytes = 0, scan_bytes = 0;
+  cub::DeviceRadixSort::SortPairs(
+    nullptr, sort_bytes, d_tgt, d_tgt_out, d_pay, d_pay_out, n_cand, 0, key_bits, stream);
+  cub::DeviceRunLengthEncode::Encode(
+    nullptr, rle_bytes, d_tgt_out, d_seg_t, d_seg_l, d_runs, n_cand, stream);
+  cub::DeviceScan::ExclusiveSum(
+    nullptr, scan_bytes, d_seg_l, d_seg_s, static_cast<int>(nrow_) + 1, stream);
+  const size_t need = std::max(sort_bytes, std::max(rle_bytes, scan_bytes));
+  if (cub_temp_.size() < need) { cub_temp_ = raft::make_device_vector<char, size_t>(res, need); }
+  void* d_tmp = cub_temp_.data_handle();
+
+  cub::DeviceRadixSort::SortPairs(
+    d_tmp, sort_bytes, d_tgt, d_tgt_out, d_pay, d_pay_out, n_cand, 0, key_bits, stream);
+  // seg_s is scanned over nrow+1, an upper bound on the run count, so nothing has to come back to
+  // the host mid-pipeline; the surplus entries must be zero for the scan to stay flat there.
+  RAFT_CUDA_TRY(
+    cudaMemsetAsync(d_seg_l, 0, sizeof(int) * (static_cast<size_t>(nrow_) + 1), stream));
+  cub::DeviceRunLengthEncode::Encode(
+    d_tmp, rle_bytes, d_tgt_out, d_seg_t, d_seg_l, d_runs, n_cand, stream);
+  cub::DeviceScan::ExclusiveSum(
+    d_tmp, scan_bytes, d_seg_l, d_seg_s, static_cast<int>(nrow_) + 1, stream);
+
+  constexpr int warps_per_block = MERGE_BLOCK_SIZE / 32;
+  const auto grid               = raft::ceildiv<size_t>(nrow_, warps_per_block);
+  merge_candidates_kernel<Index_t>
+    <<<grid, MERGE_BLOCK_SIZE, 0, stream>>>(d_seg_t,
+                                            d_seg_s,
+                                            d_seg_l,
+                                            d_runs,
+                                            d_pay_out,
+                                            graph_buffer_.data_handle(),
+                                            dists_buffer_.data_handle(),
+                                            static_cast<Index_t>(nrow_));
+  RAFT_CUDA_TRY(cudaPeekAtLastError());
 }
 
 template <typename Data_t, typename Index_t>

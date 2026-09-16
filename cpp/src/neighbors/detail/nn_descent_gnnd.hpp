@@ -231,6 +231,9 @@ class CUVS_EXPORT GNND {
                   cuvs::neighbors::device_bbq_dataset_view<std::remove_const_t<Data_t>, int64_t> dataset,
                   DistEpilogue_t dist_epilogue = DistEpilogue_t{});
 
+  // Group the candidates local_join appended and fold them into the graph.
+  void merge_deferred_candidates(cudaStream_t stream);
+
   raft::resources const& res;
 
   BuildConfig build_config_;
@@ -261,6 +264,21 @@ class CUVS_EXPORT GNND {
   raft::pinned_matrix<DistData_t, size_t> dists_host_buffer_;
 
   raft::device_vector<int, size_t> d_locks_;
+
+  // Deferred insert: local_join appends candidates here instead of taking d_locks_, then they are
+  // grouped by target and folded into the graph. cand_* hold the flat array and its sorted copy;
+  // seg_* the run-length encoding of the sorted target column.
+  size_t cand_capacity_{0};  // declared first: the arrays below size from it
+  raft::device_vector<Index_t, size_t> cand_target_;
+  raft::device_vector<uint64_t, size_t> cand_payload_;
+  raft::device_vector<Index_t, size_t> cand_target_sorted_;
+  raft::device_vector<uint64_t, size_t> cand_payload_sorted_;
+  raft::device_vector<int, size_t> cand_count_;
+  raft::device_vector<Index_t, size_t> seg_target_;
+  raft::device_vector<int, size_t> seg_len_;
+  raft::device_vector<int, size_t> seg_start_;
+  raft::device_vector<int, size_t> seg_num_runs_;
+  raft::device_vector<char, size_t> cub_temp_;
 
   raft::pinned_matrix<Index_t, size_t> h_rev_graph_new_;
   raft::pinned_matrix<Index_t, size_t> h_graph_old_;
