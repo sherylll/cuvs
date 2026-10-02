@@ -1849,6 +1849,11 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
         }
       }
 
+      // Lists are usually much shorter than MAX_NUM_BI_SAMPLES, so a warp whose whole block starts
+      // past either extent only produces cells the epilogue discards -- skip its MMA and its store.
+      // Staging is cooperative, so this must not skip either __syncthreads() in the step loop.
+      const bool warp_active = warp_id_y * WARP_TILE < new_size && warp_id_x * WARP_TILE < col_size;
+
       for (int step = 0; step < n_tiles; ++step) {
         if (!row_resident) {
           stage_promoted_tile<DocumentLayout, BBQ_ROW_BYTES>(s_row_vec,
@@ -1878,7 +1883,7 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
         // Deliberately not #pragma unroll'd: full unrolling here keeps more fragment live ranges
         // simultaneous, driving register pressure up -- letting the compiler pick reduces that at
         // the cost of some intra-warp ILP.
-        for (int kk = 0; kk < K_STEPS_PER_TILE; ++kk) {
+        for (int kk = 0; warp_active && kk < K_STEPS_PER_TILE; ++kk) {
           wmma::fragment<wmma::matrix_a, MMA_M, MMA_N, MMA_K, uint8_t, wmma::row_major>
             a_frag[SUB_PER_DIM];
           wmma::fragment<wmma::matrix_b, MMA_M, MMA_N, MMA_K, uint8_t, wmma::col_major>
@@ -1915,7 +1920,7 @@ RAFT_KERNEL __launch_bounds__(BLOCK_SIZE)
         __syncthreads();
       }
 
-      for (int msub = 0; msub < SUB_PER_DIM; ++msub) {
+      for (int msub = 0; warp_active && msub < SUB_PER_DIM; ++msub) {
         const int row0 = warp_id_y * WARP_TILE + msub * MMA_M;
         for (int nsub = 0; nsub < SUB_PER_DIM; ++nsub) {
           const int col0 = warp_id_x * WARP_TILE + nsub * MMA_N;
