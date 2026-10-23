@@ -415,45 +415,45 @@ void calc_centers_and_sizes(const raft::resources& handle,
   if (is_packed_binary) {
     if constexpr (std::is_same_v<T, uint8_t>) {
       auto decoded_dataset_iter = make_bitwise_expanded_iterator<MathT, IdxT>(dataset);
-      raft::linalg::reduce_rows_by_key(decoded_dataset_iter,
-                                       centers_dim,
-                                       labels,
-                                       nullptr,
-                                       n_rows,
-                                       centers_dim,
-                                       n_clusters,
-                                       centers,
-                                       stream.get(),
-                                       reset_counters);
+      sum_rows_by_label(decoded_dataset_iter,
+                        centers_dim,
+                        labels,
+                        static_cast<const MathT*>(nullptr),
+                        n_rows,
+                        centers_dim,
+                        n_clusters,
+                        centers,
+                        stream.get(),
+                        reset_counters);
     } else {
       RAFT_FAIL("Packed binary mode is only supported for uint8_t data type");
     }
   }
   // Apply mapping only when the data and math types are different.
   else if constexpr (std::is_same_v<T, MathT>) {
-    raft::linalg::reduce_rows_by_key(dataset,
-                                     dim,
-                                     labels,
-                                     nullptr,
-                                     n_rows,
-                                     dim,
-                                     n_clusters,
-                                     centers,
-                                     stream.get(),
-                                     reset_counters);
+    sum_rows_by_label(dataset,
+                      dim,
+                      labels,
+                      static_cast<const MathT*>(nullptr),
+                      n_rows,
+                      dim,
+                      n_clusters,
+                      centers,
+                      stream.get(),
+                      reset_counters);
   } else {
     // todo(lsugy): use iterator from KV output of fusedL2NN
     thrust::transform_iterator<MappingOpT, const T*> mapping_itr(dataset, mapping_op);
-    raft::linalg::reduce_rows_by_key(mapping_itr,
-                                     dim,
-                                     labels,
-                                     nullptr,
-                                     n_rows,
-                                     dim,
-                                     n_clusters,
-                                     centers,
-                                     stream.get(),
-                                     reset_counters);
+    sum_rows_by_label(mapping_itr,
+                      dim,
+                      labels,
+                      static_cast<const MathT*>(nullptr),
+                      n_rows,
+                      dim,
+                      n_clusters,
+                      centers,
+                      stream.get(),
+                      reset_counters);
   }
 
   // Compute weight of each cluster

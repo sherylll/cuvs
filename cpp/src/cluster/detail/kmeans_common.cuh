@@ -176,6 +176,81 @@ void countLabels(raft::resources const& handle,
                                                     stream));
 }
 
+template <int RowsPerWarp,
+          typename DataIteratorT,
+          typename LabelsIteratorT,
+          typename WeightT,
+          typename SumT,
+          typename IndexT>
+RAFT_KERNEL __launch_bounds__(64) sum_rows_by_label_kernel(DataIteratorT data,
+                                                           IndexT ld,
+                                                           LabelsIteratorT labels,
+                                                           const WeightT* weights,
+                                                           IndexT n_rows,
+                                                           IndexT n_cols,
+                                                           SumT* sums)
+{
+  const int64_t warp  = (blockIdx.x * int64_t{blockDim.x} + threadIdx.x) / raft::WarpSize;
+  const int64_t first = warp * RowsPerWarp;
+  const int64_t last  = std::min<int64_t>(first + RowsPerWarp, n_rows);
+  const int lane      = threadIdx.x % raft::WarpSize;
+  for (int64_t row = first; row < last; row++) {
+    SumT* out    = sums + static_cast<int64_t>(labels[row]) * n_cols;
+    const auto w = weights != nullptr ? static_cast<SumT>(weights[row]) : SumT{1};
+    for (int64_t col = lane; col < n_cols; col += raft::WarpSize) {
+      SumT val = data[row * ld + col];
+      if (weights != nullptr) { val *= w; }
+      raft::myAtomicAdd(out + col, val);
+    }
+  }
+}
+
+/**
+ * @brief Per-cluster (optionally weighted) sums of rows: sums[labels[i]] += weights[i] * data[i].
+ *
+ * One warp per row, so each row's label and weight are read once and its columns contiguously.
+ * raft::linalg::reduce_rows_by_key uses a thread per element, which re-reads the label and divides
+ * the flat index for every element.
+ *
+ * @param[in]    data       row-major input [n_rows x n_cols] with leading dimension `ld` (iterator)
+ * @param[in]    labels     cluster of each row, in [0, n_clusters) (iterator)
+ * @param[in]    weights    optional weight of each row [n_rows] (nullptr: all ones)
+ * @param[inout] sums       per-cluster sums [n_clusters x n_cols]
+ * @param[in]    reset_sums if true, `sums` is zeroed first; otherwise this call accumulates
+ */
+template <typename DataIteratorT,
+          typename LabelsIteratorT,
+          typename WeightT,
+          typename SumT,
+          typename IndexT>
+void sum_rows_by_label(DataIteratorT data,
+                       IndexT ld,
+                       LabelsIteratorT labels,
+                       const WeightT* weights,
+                       IndexT n_rows,
+                       IndexT n_cols,
+                       IndexT n_clusters,
+                       SumT* sums,
+                       cudaStream_t stream,
+                       bool reset_sums)
+{
+  constexpr int kRowsPerWarp = 8;
+  constexpr int kThreads     = 64;
+  if (reset_sums) {
+    RAFT_CUDA_TRY(
+      cudaMemsetAsync(sums,
+                      0,
+                      static_cast<size_t>(n_clusters) * static_cast<size_t>(n_cols) * sizeof(SumT),
+                      stream));
+  }
+  if (n_rows == 0) { return; }
+  constexpr int64_t kRowsPerBlock = kThreads / raft::WarpSize * kRowsPerWarp;
+  const auto n_blocks = raft::ceildiv<int64_t>(static_cast<int64_t>(n_rows), kRowsPerBlock);
+  sum_rows_by_label_kernel<kRowsPerWarp>
+    <<<n_blocks, kThreads, 0, stream>>>(data, ld, labels, weights, n_rows, n_cols, sums);
+  RAFT_CUDA_TRY(cudaPeekAtLastError());
+}
+
 /**
  * @brief Compute the sum of sample weights into a device scalar.
  *
@@ -635,19 +710,33 @@ void compute_centroid_adjustments(
   cudaStream_t stream = raft::resource::get_cuda_stream(handle).get();
   auto n_samples      = X.extent(0);
 
-  workspace.resize(n_samples, stream);
-
-  raft::linalg::reduce_rows_by_key(X.data_handle(),
-                                   X.extent(1),
-                                   cluster_labels,
-                                   sample_weights.data_handle(),
-                                   workspace.data(),
-                                   X.extent(0),
-                                   X.extent(1),
-                                   n_clusters,
-                                   centroid_sums.data_handle(),
-                                   stream,
-                                   reset_sums);
+  // With very few clusters every row adds into the same few addresses; raft's small-k kernel
+  // (which needs the workspace) avoids those atomics.
+  if (n_clusters <= SUM_ROWS_BY_KEY_SMALL_K_MAX_K) {
+    workspace.resize(n_samples, stream);
+    raft::linalg::reduce_rows_by_key(X.data_handle(),
+                                     X.extent(1),
+                                     cluster_labels,
+                                     sample_weights.data_handle(),
+                                     workspace.data(),
+                                     X.extent(0),
+                                     X.extent(1),
+                                     n_clusters,
+                                     centroid_sums.data_handle(),
+                                     stream,
+                                     reset_sums);
+  } else {
+    sum_rows_by_label(X.data_handle(),
+                      X.extent(1),
+                      cluster_labels,
+                      sample_weights.data_handle(),
+                      X.extent(0),
+                      X.extent(1),
+                      n_clusters,
+                      centroid_sums.data_handle(),
+                      stream,
+                      reset_sums);
+  }
 
   raft::linalg::reduce_cols_by_key(sample_weights.data_handle(),
                                    cluster_labels,
