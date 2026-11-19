@@ -12,7 +12,7 @@
 #pragma once
 
 #include "detail/pruned_top_1_nn/cutile/fused_filter_tile.hpp"
-#include "detail/pruned_top_1_nn/prune.cuh"
+#include "detail/pruned_top_1_nn/pair_prune.cuh"
 #include "top_1_nn.cuh"
 
 #include <raft/core/error.hpp>
@@ -56,7 +56,7 @@ struct workspace_layout {
   int64_t n_streams;
   int64_t row_batch_size;
   int max_blocks_per_sm;
-  std::vector<std::size_t> packed, count, filter_rows, row_order;
+  std::vector<std::size_t> packed, count, filter_rows, pairs, pair_count;
   std::size_t total_bytes;
 
   workspace_layout(raft::resources const& handle, int64_t m, bool copy_rows, int64_t batch_size)
@@ -84,7 +84,8 @@ struct workspace_layout {
     for (int64_t s = 0; s < n_streams; s++) {
       packed.push_back(take(batch_rows * kCentroidBatchSize * sizeof(int64_t)));
       count.push_back(take(batch_rows * sizeof(int32_t)));
-      row_order.push_back(take(batch_rows * sizeof(uint32_t)));
+      pairs.push_back(take(pair_queue_capacity(batch_rows) * sizeof(uint32_t)));
+      pair_count.push_back(take(sizeof(uint32_t)));
       if (copy_rows) { filter_rows.push_back(take(batch_rows * kPartialDim * sizeof(half))); }
     }
     total_bytes = end;
@@ -202,9 +203,10 @@ inline std::size_t pruned_top_1_nn_workspace_size(raft::resources const& handle,
  *
  * Not exact: a neighbor pruned away on a partial distance is missed.
  *
- * Each first-filter tile orders its rows by the newly produced survivor counts before pruning.
- * Counts are sorted within segments and their ranks interleaved, approximating heavy-first order.
- * The row order and survivor lists are scratch buffers private to each stream.
+ * Each first-filter tile builds a compact queue of survivor-slot indices. Warps progressively
+ * filter 32 pairs at a time, then completed distances are reduced per row. The queue is capped at
+ * ten percent of the batch pairs; surplus candidates are discarded. Buffers are private to each
+ * stream.
  *
  * Rows go in batches of row_batch_size against batches of kCentroidBatchSize rows of y, each
  * centroid batch tightening b for the next. The row batches round-robin over the main stream and,
@@ -279,7 +281,8 @@ void pruned_top_1_nn(raft::resources const& handle,
     const DataT* rows        = x + i * k;
     uint32_t* row_labels     = output.nearest_idx + i;
     float* row_dist          = output.nearest_dist + i;
-    auto* order              = reinterpret_cast<uint32_t*>(ws + layout.row_order[s]);
+    auto* pairs              = reinterpret_cast<uint32_t*>(ws + layout.pairs[s]);
+    auto* pair_count         = reinterpret_cast<uint32_t*>(ws + layout.pair_count[s]);
     auto* packed             = reinterpret_cast<int64_t*>(ws + layout.packed[s]);
     auto* count              = reinterpret_cast<int32_t*>(ws + layout.count[s]);
     // Each row's bound: its distance to its current neighbor
@@ -311,18 +314,18 @@ void pruned_top_1_nn(raft::resources const& handle,
                           packed,
                           count,
                           static_cast<int>(kCentroidBatchSize));
-      order_rows_by_survivors(batch_handle, count, order, n_rows, layout.max_blocks_per_sm);
-      prune(batch_handle,
-            rows,
-            n_rows,
-            order,
-            y + j * k,
-            static_cast<uint32_t>(j),
-            k,
-            packed,
-            count,
-            row_labels,
-            row_dist);
+      prune_pairs(batch_handle,
+                  rows,
+                  n_rows,
+                  y + j * k,
+                  static_cast<uint32_t>(j),
+                  k,
+                  packed,
+                  count,
+                  pairs,
+                  pair_count,
+                  row_labels,
+                  row_dist);
     }
   }
   if (pooled) { raft::resource::sync_stream_pool(handle, std::vector<std::size_t>{0}); }
