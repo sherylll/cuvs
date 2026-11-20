@@ -56,7 +56,8 @@ struct workspace_layout {
   int64_t n_streams;
   int64_t row_batch_size;
   int max_blocks_per_sm;
-  std::vector<std::size_t> packed, count, filter_rows, pairs, pair_count;
+  std::vector<std::size_t> scratch, count, filter_rows, pairs, pair_distances, row_offsets,
+    pair_count;
   std::size_t total_bytes;
 
   workspace_layout(raft::resources const& handle, int64_t m, bool copy_rows, int64_t batch_size)
@@ -82,9 +83,12 @@ struct workspace_layout {
     const int64_t batch_rows = std::min(m, row_batch_size);
     // Streams reuse their buffers only after the previous row batch finishes.
     for (int64_t s = 0; s < n_streams; s++) {
-      packed.push_back(take(batch_rows * kCentroidBatchSize * sizeof(int64_t)));
+      scratch.push_back(take(batch_rows * kCentroidBatchSize * sizeof(int64_t)));
       count.push_back(take(batch_rows * sizeof(int32_t)));
-      pairs.push_back(take(pair_queue_capacity(batch_rows) * sizeof(uint32_t)));
+      const auto capacity = pair_queue_capacity(batch_rows);
+      pairs.push_back(take(capacity * sizeof(pair_id)));
+      pair_distances.push_back(take(capacity * sizeof(float)));
+      row_offsets.push_back(take(batch_rows * sizeof(uint32_t)));
       pair_count.push_back(take(sizeof(uint32_t)));
       if (copy_rows) { filter_rows.push_back(take(batch_rows * kPartialDim * sizeof(half))); }
     }
@@ -203,10 +207,11 @@ inline std::size_t pruned_top_1_nn_workspace_size(raft::resources const& handle,
  *
  * Not exact: a neighbor pruned away on a partial distance is missed.
  *
- * Each first-filter tile builds a compact queue of survivor-slot indices. Warps progressively
- * filter 32 pairs at a time, then completed distances are reduced per row. The queue is capped at
- * ten percent of the batch pairs; surplus candidates are discarded. Buffers are private to each
- * stream.
+ * After each first filter, the queue builder writes packed row and centroid IDs and partial
+ * distances from the filter scratch into separate arrays. Warps progressively prune pairs and write
+ * back to the distance array for the per-row reduction. The queue is capped at twenty percent of
+ * the row batch times the centroid tile width, rounded down to a warp. Surplus candidates are
+ * discarded. Buffers are private to each stream.
  *
  * Rows go in batches of row_batch_size against batches of kCentroidBatchSize rows of y, each
  * centroid batch tightening b for the next. The row batches round-robin over the main stream and,
@@ -252,6 +257,8 @@ void pruned_top_1_nn(raft::resources const& handle,
   RAFT_EXPECTS(kHalf || y_fp16 != nullptr,
                "Pruned 1-NN on float needs an FP16 copy of y's first dims");
   RAFT_EXPECTS(xn != nullptr && yn != nullptr, "Pruned 1-NN needs row and centroid norms");
+  RAFT_EXPECTS(std::min(m, row_batch_size) <= kMaxPairRows,
+               "Pruned 1-NN row batch is too large for packed pair IDs");
   const workspace_layout layout(handle, m, !kHalf, row_batch_size);
   RAFT_EXPECTS(workspace_bytes >= layout.total_bytes, "Pruned 1-NN's workspace is too small");
   auto* ws = static_cast<char*>(workspace);
@@ -281,9 +288,11 @@ void pruned_top_1_nn(raft::resources const& handle,
     const DataT* rows        = x + i * k;
     uint32_t* row_labels     = output.nearest_idx + i;
     float* row_dist          = output.nearest_dist + i;
-    auto* pairs              = reinterpret_cast<uint32_t*>(ws + layout.pairs[s]);
+    auto* pairs              = reinterpret_cast<pair_id*>(ws + layout.pairs[s]);
+    auto* pair_distances     = reinterpret_cast<float*>(ws + layout.pair_distances[s]);
+    auto* row_offsets        = reinterpret_cast<uint32_t*>(ws + layout.row_offsets[s]);
     auto* pair_count         = reinterpret_cast<uint32_t*>(ws + layout.pair_count[s]);
-    auto* packed             = reinterpret_cast<int64_t*>(ws + layout.packed[s]);
+    auto* scratch            = reinterpret_cast<int64_t*>(ws + layout.scratch[s]);
     auto* count              = reinterpret_cast<int32_t*>(ws + layout.count[s]);
     // Each row's bound: its distance to its current neighbor
     const half* x_filter;
@@ -311,7 +320,7 @@ void pruned_top_1_nn(raft::resources const& handle,
                           row_dist,
                           adsampling_ratio(kPartialDim, static_cast<uint32_t>(k), kAdsamplingEps0),
                           static_cast<int>(kPartialDim),
-                          packed,
+                          scratch,
                           count,
                           static_cast<int>(kCentroidBatchSize));
       prune_pairs(batch_handle,
@@ -320,9 +329,11 @@ void pruned_top_1_nn(raft::resources const& handle,
                   y + j * k,
                   static_cast<uint32_t>(j),
                   k,
-                  packed,
+                  scratch,
                   count,
                   pairs,
+                  pair_distances,
+                  row_offsets,
                   pair_count,
                   row_labels,
                   row_dist);
