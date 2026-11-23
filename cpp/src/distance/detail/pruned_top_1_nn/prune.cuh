@@ -123,23 +123,16 @@ void squared_norms(const raft::resources& handle,
 
 using packed_winner = long long;
 
-// Order signed FP32 bit patterns for a signed integer min, including roundoff below zero.
-__device__ __forceinline__ int32_t winner_distance_key(int32_t bits)
-{
-  return bits ^ ((bits >> 31) & INT32_MAX);
-}
-
+// The fused filter clamps partial distances to zero. The tail adds squared differences,
+// so the full distances sort by their nonnegative FP32 bit patterns.
 __device__ __forceinline__ packed_winner pack_winner(float distance, uint32_t label)
 {
-  return (static_cast<packed_winner>(
-            winner_distance_key(distance == 0.f ? 0 : __float_as_int(distance)))
-          << 32) |
-         label;
+  return (static_cast<packed_winner>(__float_as_uint(distance)) << 32) | label;
 }
 
 __device__ __forceinline__ float winner_distance(packed_winner winner)
 {
-  return __int_as_float(winner_distance_key(static_cast<int32_t>(winner >> 32)));
+  return __uint_as_float(static_cast<uint32_t>(winner >> 32));
 }
 
 /** Each row's squared distance to its assigned centroid; optionally pack its filter dims as FP16.

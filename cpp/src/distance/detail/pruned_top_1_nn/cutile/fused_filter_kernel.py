@@ -68,8 +68,7 @@ def make_kernel(*, gpu_code: str, occupancy: int | None = None):
             row_norms, index=(row_tile,), shape=(tm,), padding_mode=zero_pad
         )[:, None]
         winners = ct.load(best, index=(row_tile,), shape=(tm,), padding_mode=zero_pad)
-        keys = ct.bitwise_rshift(winners, 32).astype(ct.int32)
-        bits = keys ^ (ct.bitwise_rshift(keys, 31) & 0x7FFFFFFF)
+        bits = ct.bitwise_rshift(winners, 32).astype(ct.uint32)
         threshold = ct.bitcast(bits, ct.float32)[:, None] * ratio
         # Each row's survivors so far
         filled = ct.full((tm, 1), 0, dtype=ct.int32)
@@ -97,6 +96,8 @@ def make_kernel(*, gpu_code: str, occupancy: int | None = None):
                 padding_mode=zero_pad,
             )[None, :]
             dist = -2.0 * acc + row_norm + centroid_norm
+            # Expanded L2 can round below zero when its terms nearly cancel.
+            dist = ct.where(dist <= 0.0, 0.0, dist)
             centroid_ids = (
                 centroid_tile * tn + ct.arange(tn, dtype=ct.int32)[None, :]
             )
