@@ -219,6 +219,30 @@ class pruned_assignment {
       }
     };
 
+    const auto& device    = raft::resource::get_device_properties(handle);
+    const bool one_stream = !raft::resource::is_stream_pool_initialized(handle) ||
+                            raft::resource::get_stream_pool_size(handle) == 0;
+    if (one_stream && device.major == 12 && device.minor == 0) {
+      if (fits(n_rows)) { return n_rows; }
+      // The SM120 fused-filter cubin supports two resident CTAs per SM.
+      constexpr int64_t kFilterCtasPerSm = 2;
+      const int64_t rows_per_wave =
+        kFilterCtasPerSm * device.multiProcessorCount * pruned_nn::filter_tile()->tile_m;
+
+      // Search below n_rows, since the unbatched case was checked above.
+      int64_t lo = 0;
+      int64_t hi = (n_rows - 1) / rows_per_wave;
+      while (lo < hi) {
+        const auto waves = lo + (hi - lo + 1) / 2;
+        if (fits(waves * rows_per_wave)) {
+          lo = waves;
+        } else {
+          hi = waves - 1;
+        }
+      }
+      if (lo > 0) { return lo * rows_per_wave; }
+    }
+
     constexpr int64_t alignment = pruned_nn::kAlignment / sizeof(float);
     const auto min_batch_size   = std::min(n_rows, alignment);
     auto batch_size             = n_rows;
