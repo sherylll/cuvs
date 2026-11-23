@@ -67,12 +67,10 @@ def make_kernel(*, gpu_code: str, occupancy: int | None = None):
         row_norm = ct.load(
             row_norms, index=(row_tile,), shape=(tm,), padding_mode=zero_pad
         )[:, None]
-        threshold = (
-            ct.load(
-                best, index=(row_tile,), shape=(tm,), padding_mode=zero_pad
-            )[:, None]
-            * ratio
-        )
+        winners = ct.load(best, index=(row_tile,), shape=(tm,), padding_mode=zero_pad)
+        keys = ct.bitwise_rshift(winners, 32).astype(ct.int32)
+        bits = keys ^ (ct.bitwise_rshift(keys, 31) & 0x7FFFFFFF)
+        threshold = ct.bitcast(bits, ct.float32)[:, None] * ratio
         # Each row's survivors so far
         filled = ct.full((tm, 1), 0, dtype=ct.int32)
         for centroid_tile in range(n_col_tiles):

@@ -67,7 +67,7 @@ void launch_fused_filter(const raft::resources& handle,
                          int dim,
                          const float* row_norms,
                          const float* centroid_norms,
-                         const float* best,
+                         const long long* best,
                          float ratio,
                          int partial_dim,
                          int64_t* packed,
@@ -140,7 +140,7 @@ void launch_fused_filter(const raft::resources& handle,
   void* centroids_ptr         = const_cast<half*>(centroids);
   void* row_norms_ptr         = const_cast<float*>(row_norms);
   void* centroid_norms_ptr    = const_cast<float*>(centroid_norms);
-  void* best_ptr              = const_cast<float*>(best);
+  void* best_ptr              = const_cast<long long*>(best);
   void* packed_ptr            = packed;
   void* count_ptr             = count;
   const int packed_len        = static_cast<int>(packed_size);

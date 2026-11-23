@@ -39,7 +39,7 @@ auto fused_filter_tile_config() -> std::optional<fused_filter_tile>;
  * @param centroids       [n_centroids, dim] same layout as rows
  * @param row_norms       [n_rows] squared norms over the first partial_dim dims
  * @param centroid_norms  [n_centroids] squared norms over the first partial_dim dims
- * @param best            [n_rows] each row's distance to its current centroid
+ * @param best            [n_rows] packed winner containing each row's distance and centroid ID
  * @param ratio           the pruning bound's scale at partial_dim
  * @param partial_dim     a multiple of tile_k, at most dim
  * @param packed          [n_rows * row_stride] survivors
@@ -54,7 +54,7 @@ void launch_fused_filter(const raft::resources& handle,
                          int dim,
                          const float* row_norms,
                          const float* centroid_norms,
-                         const float* best,
+                         const long long* best,
                          float ratio,
                          int partial_dim,
                          int64_t* packed,

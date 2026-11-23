@@ -121,15 +121,36 @@ void squared_norms(const raft::resources& handle,
                       copy_cols);
 }
 
+using packed_winner = long long;
+
+// Order signed FP32 bit patterns for a signed integer min, including roundoff below zero.
+__device__ __forceinline__ int32_t winner_distance_key(int32_t bits)
+{
+  return bits ^ ((bits >> 31) & INT32_MAX);
+}
+
+__device__ __forceinline__ packed_winner pack_winner(float distance, uint32_t label)
+{
+  return (static_cast<packed_winner>(
+            winner_distance_key(distance == 0.f ? 0 : __float_as_int(distance)))
+          << 32) |
+         label;
+}
+
+__device__ __forceinline__ float winner_distance(packed_winner winner)
+{
+  return __int_as_float(winner_distance_key(static_cast<int32_t>(winner >> 32)));
+}
+
 /** Each row's squared distance to its assigned centroid; optionally pack its filter dims as FP16.
  */
-template <bool Copy, typename T, typename C>
+template <bool Copy, typename T, typename C, typename Distance>
 RAFT_KERNEL distance_to_assigned_and_copy_kernel(const T* __restrict__ rows,
                                                  int64_t n,
                                                  const C* __restrict__ centroids,
                                                  int64_t dim,
                                                  const uint32_t* __restrict__ labels,
-                                                 float* __restrict__ dist,
+                                                 Distance* __restrict__ dist,
                                                  half* __restrict__ filter_rows)
 {
   const int64_t row = (blockIdx.x * int64_t{blockDim.x} + threadIdx.x) / raft::warp_size();
@@ -146,17 +167,23 @@ RAFT_KERNEL distance_to_assigned_and_copy_kernel(const T* __restrict__ rows,
     }
   }
   distance = raft::warpReduce(distance);
-  if (threadIdx.x % raft::warp_size() == 0) { dist[row] = distance; }
+  if (threadIdx.x % raft::warp_size() == 0) {
+    if constexpr (std::is_same_v<Distance, packed_winner>) {
+      dist[row] = pack_winner(distance, labels[row]);
+    } else {
+      dist[row] = distance;
+    }
+  }
 }
 
-template <bool Copy = false, typename T, typename C>
+template <bool Copy = false, typename T, typename C, typename Distance>
 void distance_to_assigned(const raft::resources& handle,
                           const T* rows,
                           int64_t n,
                           const C* centroids,
                           int64_t dim,
                           const uint32_t* labels,
-                          float* dist,
+                          Distance* dist,
                           half* filter_rows = nullptr)
 {
   constexpr uint32_t kThreads = 256;
@@ -164,7 +191,7 @@ void distance_to_assigned(const raft::resources& handle,
   raft::launch_kernel(handle,
                       blocks,
                       kThreads,
-                      distance_to_assigned_and_copy_kernel<Copy, T, C>,
+                      distance_to_assigned_and_copy_kernel<Copy, T, C, Distance>,
                       rows,
                       n,
                       centroids,

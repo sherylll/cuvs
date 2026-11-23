@@ -80,7 +80,7 @@ def _signature(data_type: str, tile_m: int, tile_n: int, tile_k: int):
             _matrix(),  # centroids (n_centroids, d)
             _vector(ct.float32, read_only),  # row_norms over d'
             _vector(ct.float32, read_only),  # centroid_norms over d'
-            _vector(ct.float32, read_only),  # best: current distances
+            _vector(ct.int64, read_only),  # best: packed winner per row
             _vector(ct.int64),  # packed survivors
             _counts(),  # count (n_rows, 1)
             ScalarConstraint(ct.int32),  # n_rows
