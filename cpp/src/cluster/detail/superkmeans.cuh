@@ -136,7 +136,7 @@ class pruned_assignment {
       n_rows_(X.extent(0)),
       dim_(X.extent(1)),
       n_clusters_(n_clusters),
-      filter_dim_(std::is_same_v<T, half> ? dim_ : pruned_nn::kPartialDim),
+      filter_dim_(std::is_same_v<T, half> ? dim_ : pruned_nn::kFilterCopyDim),
       row_norms_(raft::make_device_mdarray<float, int64_t>(
         handle,
         raft::resource::get_workspace_resource_ref(handle),

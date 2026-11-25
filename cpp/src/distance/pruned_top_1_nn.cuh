@@ -64,7 +64,7 @@ struct workspace_layout {
     pairs                    = take(pair_queue_capacity(batch_rows) * sizeof(queue_entry));
     winners                  = take(batch_rows * sizeof(packed_winner));
     pair_count               = take(sizeof(uint32_t));
-    if (copy_rows) { filter_rows = take(batch_rows * kPartialDim * sizeof(half)); }
+    if (copy_rows) { filter_rows = take(batch_rows * kFilterCopyDim * sizeof(half)); }
   }
 };
 
@@ -95,8 +95,8 @@ inline std::size_t pruned_top_1_nn_workspace_size(int64_t m, int64_t row_batch_s
  * neighbor and ratio(i) = (i / k) * (1 + eps0 / sqrt(i))^2 (ADSampling's bound, see
  * detail::pruned_nn::adsampling_ratio):
  *
- *  1. a fused FP16 GEMM over the first detail::pruned_nn::kPartialDim dims keeps the rows of y
- *     whose partial distance is under b * ratio(kPartialDim);
+ *  1. a fused FP16 GEMM over the first PartialDim dims keeps the rows of y
+ *     whose partial distance is under b * ratio(PartialDim);
  *  2. the pruning kernel adds the survivors' remaining dims a tile at a time, keeping those under
  *     b * ratio(dims so far);
  *  3. the closest survivor over all k dims replaces the current neighbor, and b, if closer.
@@ -115,14 +115,14 @@ inline std::size_t pruned_top_1_nn_workspace_size(int64_t m, int64_t row_batch_s
  *                    squared distance
  * @param x           [m, k] row-major
  * @param y           [n, k] row-major
- * @param y_fp16      [n, kPartialDim]: y's first dims in FP16, for float; ignored for half
- * @param xn          [m] squared norms of the original x over the first kPartialDim dims
- * @param yn          [n] squared norms of the FP16 filter centroids over the first kPartialDim dims
+ * @param y_fp16      [n, kFilterCopyDim]: y's first dims in FP16, for float; ignored for half
+ * @param xn          [m] squared norms of the original x over the first PartialDim dims
+ * @param yn          [n] squared norms of the FP16 filter centroids over the first PartialDim dims
  * @param row_batch_size rows per batch, matching workspace sizing
  * @param workspace   pruned_top_1_nn_workspace_size<DataT>(m, row_batch_size) bytes,
  *                    16-byte aligned
  */
-template <typename DataT>
+template <typename DataT, uint32_t PartialDim = detail::pruned_nn::kPartialDim>
 void pruned_top_1_nn(raft::resources const& handle,
                      Top1nnOutput<uint32_t, float> output,
                      const DataT* x,
@@ -142,6 +142,7 @@ void pruned_top_1_nn(raft::resources const& handle,
 #if CUVS_CUTILE_ENABLED
   using namespace detail::pruned_nn;
   constexpr bool kHalf = std::is_same_v<DataT, half>;
+  static_assert(PartialDim > 0 && PartialDim <= kFilterCopyDim);
   RAFT_EXPECTS(is_pruned_top_1_nn_available(k),
                "Pruned 1-NN needs the fused filter's cuTile kernel and a positive tail after %u "
                "dims",
@@ -157,7 +158,7 @@ void pruned_top_1_nn(raft::resources const& handle,
   auto* ws = static_cast<char*>(workspace);
 
   // The filter reads FP16 rows: half data whole, float data's FP16 copies of its first dims
-  const int64_t filter_dim = kHalf ? k : kPartialDim;
+  const int64_t filter_dim = kHalf ? k : kFilterCopyDim;
   const half* y_filter     = nullptr;
   if constexpr (kHalf) {
     y_filter = y;
@@ -195,22 +196,23 @@ void pruned_top_1_nn(raft::resources const& handle,
                           row_norms,
                           yn + j,
                           winners,
-                          adsampling_ratio(kPartialDim, static_cast<uint32_t>(k), kAdsamplingEps0),
-                          static_cast<int>(kPartialDim),
+                          adsampling_ratio(PartialDim, static_cast<uint32_t>(k), kAdsamplingEps0),
+                          static_cast<int>(PartialDim),
                           bitmap,
                           static_cast<int>(kBitmapWordsPerRow));
-      prune_pairs(handle,
-                  rows,
-                  n_rows,
-                  y + j * k,
-                  static_cast<uint32_t>(j),
-                  k,
-                  bitmap,
-                  static_cast<int>(raft::ceildiv(n_centroids, int64_t{kBitmapWordBits})),
-                  pairs,
-                  pair_count,
-                  row_dist,
-                  winners);
+      prune_pairs<PartialDim>(
+        handle,
+        rows,
+        n_rows,
+        y + j * k,
+        static_cast<uint32_t>(j),
+        k,
+        bitmap,
+        static_cast<int>(raft::ceildiv(n_centroids, int64_t{kBitmapWordBits})),
+        pairs,
+        pair_count,
+        row_dist,
+        winners);
     }
     {
       common::nvtx::range<common::nvtx::domain::cuvs> range("pruned_1nn::unpack_winners");

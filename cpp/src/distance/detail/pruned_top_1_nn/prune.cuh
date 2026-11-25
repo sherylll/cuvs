@@ -34,9 +34,11 @@
 
 namespace cuvs::distance::detail::pruned_nn {
 
-// Dims used by the first filter (d')
+// Default filter prefix (d').
 constexpr uint32_t kPartialDim = 256;
-// Dims between the survivors' re-filters
+// FP16 staging pitch for float inputs, shared by all supported prefixes.
+constexpr uint32_t kFilterCopyDim = kPartialDim;
+// Dims between progressive pruning checks.
 constexpr uint32_t kDimTileSize = 256;
 
 /** ADSampling's margin, the eps0 of adsampling_ratio. */
@@ -156,7 +158,7 @@ RAFT_KERNEL distance_to_assigned_and_copy_kernel(const T* __restrict__ rows,
     const float diff  = value - static_cast<float>(assigned_centroid[j]);
     distance += diff * diff;
     if constexpr (Copy) {
-      if (j < kPartialDim) { filter_rows[row * kPartialDim + j] = static_cast<half>(value); }
+      if (j < kFilterCopyDim) { filter_rows[row * kFilterCopyDim + j] = static_cast<half>(value); }
     }
   }
   distance = raft::warpReduce(distance);
@@ -420,7 +422,8 @@ void prune(const raft::resources& handle,
   RAFT_EXPECTS(dim % (kAlignment / sizeof(T)) == 0,
                "Pruned 1-NN needs row strides divisible by 16 bytes");
   // Whole dimension tiles keep the vectorized kernel free of tail checks.
-  const auto kernel = dim % kDimTileSize == 0 ? prune_kernel<T, true> : prune_kernel<T, false>;
+  const auto kernel =
+    (dim - kPartialDim) % kDimTileSize == 0 ? prune_kernel<T, true> : prune_kernel<T, false>;
   raft::launch_kernel(handle,
                       n_rows,
                       raft::warp_size(),
