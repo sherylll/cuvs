@@ -158,7 +158,7 @@ class pruned_assignment {
         handle,
         raft::resource::get_workspace_resource_ref(handle),
         raft::make_extents<int64_t>(
-          cuvs::distance::pruned_top_1_nn_workspace_size<T>(handle, n_rows_, row_batch_size_))))
+          cuvs::distance::pruned_top_1_nn_workspace_size<T>(n_rows_, row_batch_size_))))
   {
     // The input rows do not change between iterations, so cache their filter norms once.
     pruned_nn::squared_norms(
@@ -221,10 +221,7 @@ class pruned_assignment {
     };
 
 #if CUVS_CUTILE_ENABLED
-    const bool one_stream = !raft::resource::is_stream_pool_initialized(handle) ||
-                            raft::resource::get_stream_pool_size(handle) == 0;
-    const auto tile = one_stream ? pruned_nn::filter_tile() : std::nullopt;
-    if (tile) {
+    if (const auto tile = pruned_nn::filter_tile(); tile) {
       if (fits(n_rows)) { return n_rows; }
 
       const auto& device = raft::resource::get_device_properties(handle);

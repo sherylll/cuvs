@@ -31,8 +31,8 @@ auto fused_filter_tile_config() -> std::optional<fused_filter_tile>;
  * `partial_dim` dims, keeping the pairs below `best[row] * ratio`. FP16 only: the caller filters
  * float data on half copies of its first dims.
  *
- * Row r's survivors go to `packed` at r * row_stride + 0 .. count[r] - 1, each
- * `centroid << 32 | float bits of the partial distance`, in centroid order.
+ * Set one bit per surviving centroid in the batch, in row-major order. Words past the last
+ * centroid tile are left unwritten.
  *
  * @param handle          RAFT resources providing the stream and dry-run state
  * @param rows            [n_rows, dim] row-major, 16-byte aligned, 16-byte row pitch
@@ -42,9 +42,8 @@ auto fused_filter_tile_config() -> std::optional<fused_filter_tile>;
  * @param best            [n_rows] packed winner containing each row's distance and centroid ID
  * @param ratio           the pruning bound's scale at partial_dim
  * @param partial_dim     a multiple of tile_k, at most dim
- * @param packed          [n_rows * row_stride] survivors
- * @param count           [n_rows] survivors per row
- * @param row_stride      each row's region in `packed`, at least n_centroids
+ * @param bitmap          [n_rows, bitmap_stride] survivor bitmap
+ * @param bitmap_stride   per-row capacity in words, including padding to a centroid tile
  */
 void launch_fused_filter(const raft::resources& handle,
                          const half* rows,
@@ -57,8 +56,7 @@ void launch_fused_filter(const raft::resources& handle,
                          const long long* best,
                          float ratio,
                          int partial_dim,
-                         int64_t* packed,
-                         int* count,
-                         int row_stride);
+                         uint32_t* bitmap,
+                         int bitmap_stride);
 
 }  // namespace cuvs::distance::detail::pruned_nn

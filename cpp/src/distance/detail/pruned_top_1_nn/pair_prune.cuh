@@ -15,11 +15,14 @@
 
 namespace cuvs::distance::detail::pruned_nn {
 
-constexpr uint32_t kWarps            = 4;
-constexpr uint32_t kPairThreads      = kWarps * raft::warp_size();
-constexpr uint32_t kPairsPerWarp     = 16;
-constexpr uint32_t kPairsPerBlock    = kWarps * kPairsPerWarp;
-constexpr int64_t kBuildRowsPerBlock = 4;
+constexpr uint32_t kWarps             = 4;
+constexpr uint32_t kPairThreads       = kWarps * raft::warp_size();
+constexpr uint32_t kPairsPerWarp      = 16;
+constexpr uint32_t kPairsPerBlock     = kWarps * kPairsPerWarp;
+constexpr int64_t kBuildRowsPerBlock  = 4;
+constexpr uint32_t kBitmapWordBits    = 32;
+constexpr uint32_t kBitmapWordsPerRow = kCentroidBatchSize / kBitmapWordBits;
+static_assert(kCentroidBatchSize == kBitmapWordBits * raft::warp_size());
 
 template <typename T>
 constexpr uint32_t kPairDimTileSize = std::is_same_v<T, float> ? 128 : kDimTileSize;
@@ -46,56 +49,104 @@ inline auto pair_queue_capacity(int64_t rows) -> uint32_t
     raft::warp_size(), (rows * kCentroidBatchSize / 5) / raft::warp_size() * raft::warp_size()));
 }
 
-RAFT_KERNEL build_pairs_kernel(int64_t n_rows,
-                               const int32_t* counts,
-                               const int64_t* scratch,
-                               uint32_t capacity,
-                               queue_entry* pairs,
-                               const packed_winner* winners,
-                               float* bound,
-                               uint32_t* pair_count)
+template <typename T, bool Aligned>
+RAFT_KERNEL build_bitmap_pairs_kernel(int64_t n_rows,
+                                      int dim,
+                                      int bitmap_words,
+                                      const uint32_t* bitmap,
+                                      const T* rows,
+                                      const T* centroids,
+                                      uint32_t capacity,
+                                      queue_entry* pairs,
+                                      const packed_winner* winners,
+                                      float* bound,
+                                      uint32_t* pair_count)
 {
-  using RowScan = cub::WarpScan<uint32_t, kBuildRowsPerBlock>;
-  __shared__ RowScan::TempStorage scan_storage;
-  __shared__ uint32_t offsets[kBuildRowsPerBlock + 1];
-  const int64_t first = blockIdx.x * kBuildRowsPerBlock;
-  const uint32_t warp = threadIdx.x / raft::warp_size();
-  const uint32_t lane = threadIdx.x % raft::warp_size();
+  constexpr int kWarpSize    = raft::warp_size();
+  constexpr int kDimsPerLane = kPartialDim / kWarpSize;
+
+  using BitmapScan = cub::WarpScan<uint32_t, kWarpSize>;
+  using RowScan    = cub::WarpScan<uint32_t, kBuildRowsPerBlock>;
+  // Both power-of-two scans use shuffles and empty CUB storage.
+  __shared__ BitmapScan::TempStorage bitmap_scan[kBuildRowsPerBlock];
+  __shared__ RowScan::TempStorage row_scan;
+  __shared__ uint32_t row_counts[kBuildRowsPerBlock];
+  __shared__ uint32_t queue_offsets[kBuildRowsPerBlock];
+  __shared__ uint16_t survivor_centroids[kBuildRowsPerBlock][kCentroidBatchSize];
+
+  const int warp           = threadIdx.x / kWarpSize;
+  const int lane           = raft::laneId();
+  const uint32_t first_row = blockIdx.x * kBuildRowsPerBlock;
+  const uint32_t row       = first_row + warp;
+
+  // Each lane owns one word. The final centroid batch may leave later words unwritten.
+  uint32_t word = row < n_rows && lane < bitmap_words ? bitmap[row * kBitmapWordsPerRow + lane] : 0;
+  uint32_t word_offset, row_count;
+  BitmapScan(bitmap_scan[warp]).ExclusiveSum(__popc(word), word_offset, row_count);
+  if (lane == 0) { row_counts[warp] = row_count; }
+  __syncthreads();
+
+  // Reserve one span per block and give each row its part of that span.
   if (threadIdx.x < kBuildRowsPerBlock) {
-    // Reserve once per block. The scan assigns adjacent spans to the row warps.
-    constexpr uint32_t kScanMask = (1u << kBuildRowsPerBlock) - 1;
-    const uint32_t size = first + lane < n_rows ? static_cast<uint32_t>(counts[first + lane]) : 0;
-    // Prune reads this snapshot while it updates the packed winners.
-    if (size != 0) { bound[first + lane] = winner_distance(winners[first + lane]); }
-    uint32_t prefix, total;
-    RowScan(scan_storage).ExclusiveSum(size, prefix, total);
-    const uint32_t reserved = lane == 0 && total != 0 ? atomicAdd(pair_count, total) : 0;
-    const uint32_t base     = raft::shfl(reserved, 0, kBuildRowsPerBlock, kScanMask);
-    offsets[lane]           = base + prefix;
-    if (lane == 0) { offsets[kBuildRowsPerBlock] = base + total; }
+    const uint32_t count = row_counts[lane];
+    // Keep the pruning bound fixed while the tail kernel updates winners.
+    if (count != 0) { bound[first_row + lane] = winner_distance(winners[first_row + lane]); }
+    uint32_t row_offset, block_count;
+    RowScan(row_scan).ExclusiveSum(count, row_offset, block_count);
+    const uint32_t reserved =
+      lane == 0 && block_count != 0 ? atomicAdd(pair_count, block_count) : 0;
+    constexpr uint32_t kRowMask = (1u << kBuildRowsPerBlock) - 1;
+    queue_offsets[lane] = raft::shfl(reserved, 0, kBuildRowsPerBlock, kRowMask) + row_offset;
   }
   __syncthreads();
-  const uint32_t base = offsets[warp];
-  const uint32_t size = offsets[warp + 1] - base;
-  if (size == 0) { return; }
-  const int64_t row = first + warp;
-  if (base >= capacity) { return; }
-  const uint32_t retained = min(size, capacity - base);
-  const auto* survivors   = scratch + row * kCentroidBatchSize;
-  // The scratch entry already has the centroid and partial distance in the right bits.
-  const queue_entry row_bits = static_cast<queue_entry>(row)
-                               << (kSurvivorIdShift + kPairCentroidBits);
-  // Peel a single entry at either end so two consecutive stores can use a 16-byte vector.
-  const uint32_t head = base & 1u;
-  const uint32_t tail = (retained - head) & 1u;
-  if (lane < head + tail) {
-    const uint32_t q = lane < head ? 0 : retained - 1;
-    pairs[base + q]  = row_bits | static_cast<queue_entry>(survivors[q]);
+
+  const uint32_t queue_offset = queue_offsets[warp];
+  if (queue_offset >= capacity || row_count == 0) { return; }
+  const uint32_t retained = min(row_count, capacity - queue_offset);
+
+  // Enumerate retained centroids in bitmap order for this row's warp.
+  for (uint32_t index = word_offset; word != 0 && index < retained; ++index) {
+    survivor_centroids[warp][index] = lane * kBitmapWordBits + (__ffs(word) - 1);
+    word &= word - 1;
   }
-  for (uint32_t q = head + 2 * lane; q + 1 < retained; q += 2 * raft::warp_size()) {
-    const queue_entry first  = row_bits | static_cast<queue_entry>(survivors[q]);
-    const queue_entry second = row_bits | static_cast<queue_entry>(survivors[q + 1]);
-    *reinterpret_cast<ulonglong2*>(pairs + base + q) = make_ulonglong2(first, second);
+  raft::warpFence();
+
+  T row_tile[kDimsPerLane];
+  load_tile<kPartialDim, Aligned>(rows + int64_t{row} * dim, kPartialDim, row_tile);
+  const auto partial_distance = [&](uint32_t index) {
+    const uint32_t centroid = survivor_centroids[warp][index];
+    T centroid_tile[kDimsPerLane];
+    load_tile<kPartialDim, Aligned>(
+      centroids + int64_t{centroid} * dim, kPartialDim, centroid_tile);
+    float distance = 0.f;
+#pragma unroll
+    for (int d = 0; d < kDimsPerLane; ++d) {
+      const float delta = static_cast<float>(row_tile[d]) - static_cast<float>(centroid_tile[d]);
+      distance          = fmaf(delta, delta, distance);
+    }
+    return distance;
+  };
+  const auto store_pair = [&](uint32_t index, float distance) {
+    const pair_id id            = (row << kPairCentroidBits) | survivor_centroids[warp][index];
+    pairs[queue_offset + index] = (queue_entry{id} << kSurvivorIdShift) | __float_as_uint(distance);
+  };
+
+  constexpr uint32_t kBatchSize = 8;
+  using BatchReduce             = cub::WarpReduceBatched<float, kBatchSize>;
+  typename BatchReduce::TempStorage storage;
+  uint32_t index = 0;
+  for (; index + kBatchSize <= retained; index += kBatchSize) {
+    float partial[kBatchSize];
+#pragma unroll
+    for (uint32_t j = 0; j < kBatchSize; ++j) {
+      partial[j] = partial_distance(index + j);
+    }
+    const float distance = BatchReduce(storage).Sum(partial);
+    if (lane < kBatchSize) { store_pair(index + lane, distance); }
+  }
+  for (; index < retained; ++index) {
+    const float distance = raft::warpReduce(partial_distance(index));
+    if (lane == 0) { store_pair(index, distance); }
   }
 }
 
@@ -250,15 +301,7 @@ RAFT_KERNEL unpack_winners_kernel(int64_t n_rows,
   }
 }
 
-/**
- * Build and pad the queue, then progressively prune pairs and update each row's winner.
- *
- * Nsight Systems on RTX PRO 6000 (SM120), OpenAI FP32 with 4.99M rows of dimension 1,536,
- * 50% training, 8,192 centroids, 10 iterations, and a 512 MiB workspace budget.
- * Queue build and padding took 125.98 ms (117.52 ms in build_pairs_kernel and 8.46 ms in
- * pad_pairs_kernel). Pruning took 692.28 ms in pair_tail_kernel.
- * Each kernel ran 8,784 times. GPU durations are summed across two overlapping streams.
- */
+/** Build and pad the bitmap-derived queue, then progressively prune and update row winners. */
 template <typename T>
 void prune_pairs(const raft::resources& handle,
                  const T* rows,
@@ -266,14 +309,17 @@ void prune_pairs(const raft::resources& handle,
                  const T* centroids,
                  uint32_t centroid_offset,
                  int64_t dim,
-                 const int64_t* scratch,
-                 const int32_t* count,
+                 const uint32_t* bitmap,
+                 int bitmap_words,
                  queue_entry* pairs,
                  uint32_t* pair_count,
                  float* bound,
                  packed_winner* winners)
 {
   const auto capacity = pair_queue_capacity(n_rows);
+  const bool aligned  = dim % kPairDimTileSize<T> == 0;
+  const auto build_kernel =
+    aligned ? build_bitmap_pairs_kernel<T, true> : build_bitmap_pairs_kernel<T, false>;
   {
     common::nvtx::range<common::nvtx::domain::cuvs> range("pruned_1nn::build_pairs");
     RAFT_CUDA_TRY(cudaMemsetAsync(
@@ -281,10 +327,13 @@ void prune_pairs(const raft::resources& handle,
     raft::launch_kernel(handle,
                         raft::ceildiv(n_rows, kBuildRowsPerBlock),
                         kBuildRowsPerBlock * raft::warp_size(),
-                        build_pairs_kernel,
+                        build_kernel,
                         n_rows,
-                        count,
-                        scratch,
+                        static_cast<int>(dim),
+                        bitmap_words,
+                        bitmap,
+                        rows,
+                        centroids,
                         capacity,
                         pairs,
                         winners,
@@ -295,8 +344,7 @@ void prune_pairs(const raft::resources& handle,
   }
   {
     common::nvtx::range<common::nvtx::domain::cuvs> range("pruned_1nn::pair_tail");
-    const auto kernel =
-      dim % kPairDimTileSize<T> == 0 ? pair_tail_kernel<T, true> : pair_tail_kernel<T, false>;
+    const auto kernel          = aligned ? pair_tail_kernel<T, true> : pair_tail_kernel<T, false>;
     constexpr int kBlocksPerSm = 16;
     const auto blocks          = std::min<uint32_t>(
       raft::ceildiv(capacity, kPairsPerBlock),
