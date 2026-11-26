@@ -205,14 +205,26 @@ class pruned_assignment {
                                 raft::device_matrix_view<const T, int64_t> X,
                                 int64_t n_clusters) -> int64_t
   {
-    const auto n_rows = X.extent(0);
+    const auto n_rows                    = X.extent(0);
+    constexpr int64_t initial_batch_size = 256 * 1024;
+    int64_t rows_per_group               = 1;
+#if CUVS_CUTILE_ENABLED
+    if (const auto tile = pruned_nn::filter_tile(); tile) {
+      const auto& device = raft::resource::get_device_properties(handle);
+      // Two CTAs per SM worth of tiles form full waves with either one or two resident CTAs.
+      rows_per_group = int64_t{2} * device.multiProcessorCount * tile->tile_m;
+    }
+#endif
+    const auto aligned_batch_size = initial_batch_size / rows_per_group * rows_per_group;
+    auto batch_size =
+      std::min(n_rows, aligned_batch_size > 0 ? aligned_batch_size : initial_batch_size);
     const auto budget = std::min<std::size_t>(
       (raft::resource::get_workspace_free_bytes(handle) / 10) * 8, std::size_t{1} << 29);
-    const auto fits = [&](int64_t batch_size) {
+    const auto fits = [&](int64_t candidate_size) {
       try {
         const auto stats =
           raft::util::dry_run_execute(handle, [&](const raft::resources& dry_handle) {
-            pruned_assignment candidate(dry_handle, X, n_clusters, batch_size);
+            pruned_assignment candidate(dry_handle, X, n_clusters, candidate_size);
           });
         return stats.device_workspace <= budget;
       } catch (const rmm::bad_alloc&) {
@@ -220,17 +232,12 @@ class pruned_assignment {
       }
     };
 
-#if CUVS_CUTILE_ENABLED
-    if (const auto tile = pruned_nn::filter_tile(); tile) {
-      if (fits(n_rows)) { return n_rows; }
+    if (fits(batch_size)) { return batch_size; }
 
-      const auto& device = raft::resource::get_device_properties(handle);
-      // Two CTAs per SM worth of tiles form full waves with either one or two resident CTAs.
-      const int64_t rows_per_group = int64_t{2} * device.multiProcessorCount * tile->tile_m;
-
-      // Search below n_rows, since the unbatched case was checked above.
+    if (rows_per_group > 1) {
+      // Search smaller full waves after the initial batch failed the dry run.
       int64_t lo = 0;
-      int64_t hi = (n_rows - 1) / rows_per_group;
+      int64_t hi = (batch_size - 1) / rows_per_group;
       while (lo < hi) {
         const auto groups = lo + (hi - lo + 1) / 2;
         if (fits(groups * rows_per_group)) {
@@ -241,18 +248,16 @@ class pruned_assignment {
       }
       if (lo > 0) { return lo * rows_per_group; }
     }
-#endif
 
     constexpr int64_t alignment = pruned_nn::kAlignment / sizeof(float);
     const auto min_batch_size   = std::min(n_rows, alignment);
-    auto batch_size             = n_rows;
-    while (!fits(batch_size)) {
+    do {
       RAFT_EXPECTS(batch_size > min_batch_size,
                    "Insufficient workspace for SuperKMeans pruned assignment");
       const auto half_batch      = raft::ceildiv(batch_size, int64_t{2});
       const int64_t row_multiple = half_batch >= 1024 ? 1024 : alignment;
       batch_size                 = raft::round_up_safe(half_batch, row_multiple);
-    }
+    } while (!fits(batch_size));
     return batch_size;
   }
 
