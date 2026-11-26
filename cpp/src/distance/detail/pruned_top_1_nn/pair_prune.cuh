@@ -208,8 +208,8 @@ RAFT_KERNEL pair_tail_kernel(const T* rows,
     float best              = lane < live ? bound[pair_row(pair)] : 0.f;
     uint32_t d              = PartialDim;
     for (; live > 1 && d < dim; d += kTileDims) {
-      uint32_t i = 0;
-      for_each_halving<16>([&](auto tile) {
+      uint32_t i               = 0;
+      const auto process_batch = [&](auto tile) {
         constexpr uint32_t kTile = decltype(tile)::value;
         for (; i + kTile <= live; i += kTile) {
           float partial[kTile];
@@ -244,7 +244,10 @@ RAFT_KERNEL pair_tail_kernel(const T* rows,
             if (lane >= i && lane < i + kTile) { distance += tail; }
           }
         }
-      });
+      };
+      process_batch(std::integral_constant<uint32_t, kPairsPerWarp>{});
+      process_batch(std::integral_constant<uint32_t, 4>{});
+      process_batch(std::integral_constant<uint32_t, 1>{});
       const bool last   = d + kTileDims >= dim;
       const float ratio = last ? 1.f : adsampling_ratio(d + kTileDims, dim, kAdsamplingEps0);
       const bool keep   = lane < live && distance < best * ratio;

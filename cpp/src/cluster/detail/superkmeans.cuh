@@ -205,9 +205,12 @@ class pruned_assignment {
                                 raft::device_matrix_view<const T, int64_t> X,
                                 int64_t n_clusters) -> int64_t
   {
-    const auto n_rows                    = X.extent(0);
     constexpr int64_t initial_batch_size = 256 * 1024;
-    int64_t rows_per_group               = 1;
+    static_assert(initial_batch_size <= pruned_nn::kMaxPairRows,
+                  "Initial SuperKMeans row batch is too large for packed pair IDs");
+
+    const auto n_rows      = X.extent(0);
+    int64_t rows_per_group = 1;
 #if CUVS_CUTILE_ENABLED
     if (const auto tile = pruned_nn::filter_tile(); tile) {
       const auto& device = raft::resource::get_device_properties(handle);
