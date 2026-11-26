@@ -61,7 +61,7 @@ struct workspace_layout {
     };
     const int64_t batch_rows = std::min(m, row_batch_size);
     bitmap                   = take(batch_rows * kBitmapWordsPerRow * sizeof(uint32_t));
-    pairs                    = take(pair_queue_capacity(batch_rows) * sizeof(queue_entry));
+    pairs                    = take(pair_queue_capacity(batch_rows) * sizeof(pair_id));
     winners                  = take(batch_rows * sizeof(packed_winner));
     pair_count               = take(sizeof(uint32_t));
     if (copy_rows) { filter_rows = take(batch_rows * kFilterCopyDim * sizeof(half)); }
@@ -97,16 +97,16 @@ inline std::size_t pruned_top_1_nn_workspace_size(int64_t m, int64_t row_batch_s
  *
  *  1. a fused FP16 GEMM over the first PartialDim dims keeps the rows of y
  *     whose partial distance is under b * ratio(PartialDim);
- *  2. the pruning kernel adds the survivors' remaining dims a tile at a time, keeping those under
- *     b * ratio(dims so far);
+ *  2. the pruning kernel reconstructs the survivors' prefix distances from the original data and
+ *     adds the remaining dims a tile at a time, keeping those under b * ratio(dims so far);
  *  3. the closest survivor over all k dims replaces the current neighbor, and b, if closer.
  *
  * Not exact: a neighbor pruned away on a partial distance is missed.
  *
- * After each first filter, the builder compacts the survivor bitmap into a queue and recomputes
- * the partial distance of each retained pair. Warps progressively prune pairs and atomically update
- * each row's winner with completed distances. The queue is capped at twenty percent of the row
- * batch times the centroid tile width, rounded down to a warp. Surplus candidates are discarded.
+ * After each first filter, the builder compacts the survivor bitmap into a queue of packed pair
+ * IDs. Warps progressively prune pairs and atomically update each row's winner with completed
+ * distances. The queue is capped at twenty percent of the row batch times the centroid tile
+ * width, rounded down to a warp. Surplus candidates are discarded.
  *
  * Rows go in batches of row_batch_size against batches of kCentroidBatchSize rows of y, each
  * centroid batch tightening b for the next. All batches reuse the workspace on the handle's stream.
@@ -165,7 +165,7 @@ void pruned_top_1_nn(raft::resources const& handle,
   } else {
     y_filter = y_fp16;
   }
-  auto* pairs      = reinterpret_cast<queue_entry*>(ws + layout.pairs);
+  auto* pairs      = reinterpret_cast<pair_id*>(ws + layout.pairs);
   auto* winners    = reinterpret_cast<packed_winner*>(ws + layout.winners);
   auto* pair_count = reinterpret_cast<uint32_t*>(ws + layout.pair_count);
   auto* bitmap     = reinterpret_cast<uint32_t*>(ws + layout.bitmap);
