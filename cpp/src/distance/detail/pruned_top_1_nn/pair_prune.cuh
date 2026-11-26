@@ -141,7 +141,8 @@ RAFT_KERNEL build_bitmap_pairs_kernel(int64_t n_rows,
   for (; index + kBuildPairsPerBatch <= retained; index += kBuildPairsPerBatch) {
     process_batch(std::integral_constant<uint32_t, kBuildPairsPerBatch>{}, index);
   }
-  for_each_halving<kBuildPairsPerBatch / 2>([&](auto tile) {
+  static_assert(kBuildPairsPerBatch <= 8, "The 4/2/1 remainder handles up to seven pairs");
+  const auto process_remainder = [&](auto tile) {
     constexpr uint32_t kTile = decltype(tile)::value;
     if (index + kTile > retained) { return; }
     if constexpr (kTile == 1) {
@@ -151,7 +152,10 @@ RAFT_KERNEL build_bitmap_pairs_kernel(int64_t n_rows,
       process_batch(tile, index);
     }
     index += kTile;
-  });
+  };
+  process_remainder(std::integral_constant<uint32_t, 4>{});
+  process_remainder(std::integral_constant<uint32_t, 2>{});
+  process_remainder(std::integral_constant<uint32_t, 1>{});
 }
 
 /** Finalize the capped queue with invalid pair IDs in its last warp. */
