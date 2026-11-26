@@ -82,7 +82,6 @@ def _signature(data_type: str, tile_m: int, tile_n: int, tile_k: int):
             _vector(ct.float32, read_only),  # centroid_norms over d'
             _vector(ct.int64, read_only),  # best: packed winner per row
             _bitmap(),  # bitmap words per row
-            ScalarConstraint(ct.int32),  # n_rows
             ScalarConstraint(ct.int32),  # n_centroids
             ScalarConstraint(ct.float32),  # ratio
             ScalarConstraint(ct.int32),  # d'

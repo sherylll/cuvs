@@ -37,7 +37,6 @@ def make_kernel(*, gpu_code: str, occupancy: int | None = None):
         centroid_norms,
         best,
         bitmap,
-        n_rows,
         n_centroids,
         ratio,
         dp,
@@ -48,7 +47,6 @@ def make_kernel(*, gpu_code: str, occupancy: int | None = None):
         row_tile = ct.bid(0)
         zero_pad = ct.PaddingMode.ZERO
         n_col_tiles = ct.num_tiles(centroids, axis=0, shape=(tn, tk))
-        row_ids = row_tile * tm + ct.arange(tm, dtype=ct.int32)[:, None]
         row_norm = ct.load(
             row_norms, index=(row_tile,), shape=(tm,), padding_mode=zero_pad
         )[:, None]
@@ -85,11 +83,7 @@ def make_kernel(*, gpu_code: str, occupancy: int | None = None):
             centroid_ids = (
                 centroid_tile * tn + ct.arange(tn, dtype=ct.int32)[None, :]
             )
-            keep = (
-                (dist < threshold)
-                & (centroid_ids < n_centroids)
-                & (row_ids < n_rows)
-            )
+            keep = (dist < threshold) & (centroid_ids < n_centroids)
             # Each group of 32 predicates contributes distinct bits to one bitmap word.
             mask = ct.reshape(keep, (tm, tn // 32, 32)).astype(ct.uint32)
             words = ct.sum(ct.bitwise_lshift(mask, shifts), axis=2).astype(ct.uint32)

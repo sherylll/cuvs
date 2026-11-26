@@ -129,8 +129,7 @@ void launch_fused_filter(const raft::resources& handle,
                                      int,
                                      int,
                                      int,  // bitmap
-                                     int,
-                                     int,
+                                     int,  // n_centroids
                                      float,
                                      int);
   void* rows_ptr              = const_cast<half*>(rows);
@@ -172,7 +171,6 @@ void launch_fused_filter(const raft::resources& handle,
                       int{bitmap_stride},
                       int{bitmap_stride},
                       int{unit},
-                      int{n_rows},
                       int{n_centroids},
                       float{ratio},
                       int{partial_dim});
