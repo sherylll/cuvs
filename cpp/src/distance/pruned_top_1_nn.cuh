@@ -43,7 +43,8 @@ inline auto filter_tile() -> std::optional<fused_filter_tile>
 
 /** Byte offsets for the buffers reused by each row batch on the handle's stream. */
 struct workspace_layout {
-  std::size_t bitmap = 0, filter_rows = 0, pairs = 0, winners = 0, pair_count = 0;
+  std::size_t bitmap = 0, filter_rows = 0, offsets = 0, winners = 0, scan = 0;
+  std::size_t scan_bytes  = 0;
   std::size_t total_bytes = 0;
 
   workspace_layout(int64_t m, bool copy_rows, int64_t row_batch_size)
@@ -61,9 +62,10 @@ struct workspace_layout {
     };
     const int64_t batch_rows = std::min(m, row_batch_size);
     bitmap                   = take(batch_rows * kBitmapWordsPerRow * sizeof(uint32_t));
-    pairs                    = take(pair_queue_capacity(batch_rows) * sizeof(pair_id));
+    offsets                  = take((batch_rows + 1) * sizeof(uint32_t));
     winners                  = take(batch_rows * sizeof(packed_winner));
-    pair_count               = take(sizeof(uint32_t));
+    scan_bytes               = row_scan_workspace_size(batch_rows);
+    scan                     = take(scan_bytes);
     if (copy_rows) { filter_rows = take(batch_rows * kFilterCopyDim * sizeof(half)); }
   }
 };
@@ -103,10 +105,9 @@ inline std::size_t pruned_top_1_nn_workspace_size(int64_t m, int64_t row_batch_s
  *
  * Not exact: a neighbor pruned away on a partial distance is missed.
  *
- * After each first filter, the builder compacts the survivor bitmap into a queue of packed pair
- * IDs. Warps progressively prune pairs and atomically update each row's winner with completed
- * distances. The queue is capped at twenty percent of the row batch times the centroid tile
- * width, rounded down to a warp. Surplus candidates are discarded.
+ * After each first filter, a scan of survivor counts locates each row in the logical list of
+ * survivors. Pruning CTAs decode consecutive spans of that list from the bitmap and atomically
+ * update row winners with completed distances.
  *
  * Rows go in batches of row_batch_size against batches of kCentroidBatchSize rows of y, each
  * centroid batch tightening b for the next. All batches reuse the workspace on the handle's stream.
@@ -165,10 +166,9 @@ void pruned_top_1_nn(raft::resources const& handle,
   } else {
     y_filter = y_fp16;
   }
-  auto* pairs      = reinterpret_cast<pair_id*>(ws + layout.pairs);
-  auto* winners    = reinterpret_cast<packed_winner*>(ws + layout.winners);
-  auto* pair_count = reinterpret_cast<uint32_t*>(ws + layout.pair_count);
-  auto* bitmap     = reinterpret_cast<uint32_t*>(ws + layout.bitmap);
+  auto* offsets = reinterpret_cast<uint32_t*>(ws + layout.offsets);
+  auto* winners = reinterpret_cast<packed_winner*>(ws + layout.winners);
+  auto* bitmap  = reinterpret_cast<uint32_t*>(ws + layout.bitmap);
   for (int64_t i = 0; i < m; i += row_batch_size) {
     const int64_t n_rows = std::min(row_batch_size, m - i);
     const DataT* rows    = x + i * k;
@@ -209,8 +209,9 @@ void pruned_top_1_nn(raft::resources const& handle,
         k,
         bitmap,
         static_cast<int>(raft::ceildiv(n_centroids, int64_t{kBitmapWordBits})),
-        pairs,
-        pair_count,
+        offsets,
+        ws + layout.scan,
+        layout.scan_bytes,
         row_dist,
         winners);
     }

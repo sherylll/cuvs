@@ -113,9 +113,9 @@ void predict(const raft::resources& handle,
 
 /**
  * The pruned assignment (cuvs::distance::pruned_top_1_nn) and what it keeps across iterations: the
- * row norms and the workspace. Float filter rows are prepared per batch.
- * The centroids the 1-NN reads are T: for half rows, a half copy of the float centroids, which is
- * also the filter's.
+ * row norms and the workspace. The filter reads FP16 copies of the centroid prefixes and, for
+ * float input, FP16 copies of the row prefixes prepared per batch. With half input, the filter
+ * and prune use the same FP16 centroid copy.
  */
 template <typename T>
 class pruned_assignment {
@@ -205,7 +205,7 @@ class pruned_assignment {
                                 raft::device_matrix_view<const T, int64_t> X,
                                 int64_t n_clusters) -> int64_t
   {
-    constexpr int64_t initial_batch_size = 256 * 1024;
+    constexpr int64_t initial_batch_size = 512 * 1024;
     static_assert(initial_batch_size <= pruned_nn::kMaxPairRows,
                   "Initial SuperKMeans row batch is too large for packed pair IDs");
 
@@ -335,7 +335,7 @@ void fit(const raft::resources& handle,
   };
 
   std::optional<pruned_assignment<T>> pruned_assign;
-  if (pruned) { pruned_assign.emplace(handle, X, n_clusters); }
+  if (pruned && params.n_iters > 1) { pruned_assign.emplace(handle, X, n_clusters); }
 
   for (uint32_t iter = 0; iter < params.n_iters; iter++) {
     if (pruned_assign.has_value() && iter > 0) {
